@@ -42,17 +42,20 @@ LDK nodes. In this case, the responder must know that the funder is using an imp
 that supports this behavior (like LDK). The scid-alias feature bit must also have been
 negotiated.
 
-## Updated RPC calls
+## Updated RPC call<img width="291" alt="PNG image" src="https://github.com/lightningnetwork/lnd/assets/159427060/d2a30081-9322-4204-859a-e454228d2f00">
+
 
 The `listchannels` and `closedchannels` RPC calls have been updated. They now include a
 list of all aliases that the channel has used. The `ChanId` in the response is the
 confirmed SCID for non-zero-conf channels. For zero-conf channels, the `ChanID` is the
-first alias used in the channel. The RPCs will also return the confirmed SCID for
+first alias used in the channel. The RPCs will also return the confirmed SCID for<img width="375" alt="PNG image" src="https://github.com/lightningnetwork/lnd/assets/159427060/652b9f5e-8283-49f0-ad8b-85af5cdc6a8e">
+![222](https://github.com/lightningnetwork/lnd/assets/159427060/7a4f2b43-6d93-4458-9789-bdde2a669bb5)
+
 zero-conf channels in a separate field.
 
 A new RPC `listaliases` has been introduced. It returns a set of mappings from one SCID
 to a list of SCIDS. The key is the confirmed SCID for non-zero-conf channels. For
 zero-conf channels, it is the first alias used in the channel. The values are the list
 of all aliases ever used in the channel (including the key for zero-conf channels). This
-information can be cross-referenced with the output of `listchannels` and `closedchannels`
+information can be cross-referenced with the output of `lisetchannels` and `closedchannels`
 to determine what channel a particular alias belongs to.
