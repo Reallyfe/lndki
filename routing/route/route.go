@@ -133,6 +133,11 @@ type Hop struct {
 	// LegacyPayload if true, then this signals that this node doesn't
 	// understand the new TLV payload, so we must instead use the legacy
 	// payload.
+	//
+	// NOTE: we should no longer ever create a Hop with Legacy set to true.
+	// The only reason we are keeping this member is that it could be the
+	// case that we have serialised hops persisted to disk where
+	// LegacyPayload is true.
 	LegacyPayload bool
 
 	// Metadata is additional data that is sent along with the payment to
@@ -190,7 +195,7 @@ func (h *Hop) PackHopPayload(w io.Writer, nextChanID uint64,
 
 	// If this is a legacy payload, then we'll exit here as this method
 	// shouldn't be called.
-	if h.LegacyPayload == true {
+	if h.LegacyPayload {
 		return fmt.Errorf("cannot pack hop payloads for legacy " +
 			"payloads")
 	}
@@ -370,8 +375,8 @@ func validateNextChanID(nextChanIDIsSet, isBlinded, finalHop bool) error {
 	}
 }
 
-// Size returns the total size this hop's payload would take up in the onion
-// packet.
+// PayloadSize returns the total size this hop's payload would take up in the
+// onion packet.
 func (h *Hop) PayloadSize(nextChanID uint64) uint64 {
 	if h.LegacyPayload {
 		return sphinx.LegacyHopDataSize
@@ -483,6 +488,26 @@ type Route struct {
 	// Hops contains details concerning the specific forwarding details at
 	// each hop.
 	Hops []*Hop
+
+	// FirstHopAmount is the amount that should actually be sent to the
+	// first hop in the route. This is only different from TotalAmount above
+	// for custom channels where the on-chain amount doesn't necessarily
+	// reflect all the value of an outgoing payment.
+	FirstHopAmount tlv.RecordT[
+		tlv.TlvType0, tlv.BigSizeT[lnwire.MilliSatoshi],
+	]
+
+	// FirstHopWireCustomRecords is a set of custom records that should be
+	// included in the wire message sent to the first hop. This is only set
+	// on custom channels and is used to include additional information
+	// about the actual value of the payment.
+	//
+	// NOTE: Since these records already represent TLV records, and we
+	// enforce them to be in the custom range (e.g. >= 65536), we don't use
+	// another parent record type here. Instead, when serializing the Route
+	// we merge the TLV records together with the custom records and encode
+	// everything as a single TLV stream.
+	FirstHopWireCustomRecords lnwire.CustomRecords
 }
 
 // Copy returns a deep copy of the Route.

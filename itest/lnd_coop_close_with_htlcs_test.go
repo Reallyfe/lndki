@@ -85,6 +85,7 @@ func coopCloseWithHTLCs(ht *lntest.HarnessTest) {
 	closeClient := alice.RPC.CloseChannel(&lnrpc.CloseChannelRequest{
 		ChannelPoint: chanPoint,
 		NoWait:       true,
+		TargetConf:   6,
 	})
 	ht.AssertChannelInactive(bob, chanPoint)
 
@@ -116,7 +117,7 @@ func coopCloseWithHTLCs(ht *lntest.HarnessTest) {
 	)
 
 	// Wait for the close tx to be in the Mempool.
-	ht.Miner.AssertTxInMempool(&closeTxid)
+	ht.AssertTxInMempool(&closeTxid)
 
 	// Wait for it to get mined and finish tearing down.
 	ht.AssertStreamChannelCoopClosed(alice, chanPoint, false, closeClient)
@@ -184,6 +185,7 @@ func coopCloseWithHTLCsWithRestart(ht *lntest.HarnessTest) {
 		ChannelPoint:    chanPoint,
 		NoWait:          true,
 		DeliveryAddress: newAddr.Address,
+		TargetConf:      6,
 	})
 
 	// Assert that both nodes see the channel as waiting for close.

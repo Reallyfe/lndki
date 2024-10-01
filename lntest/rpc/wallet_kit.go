@@ -68,6 +68,16 @@ func (h *HarnessRPC) FundPsbt(
 	return resp
 }
 
+// FundPsbtAssertErr makes a RPC call to the node's FundPsbt and asserts an
+// error is returned.
+func (h *HarnessRPC) FundPsbtAssertErr(req *walletrpc.FundPsbtRequest) {
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.WalletKit.FundPsbt(ctxt, req)
+	require.Error(h, err, "expected error returned")
+}
+
 // FinalizePsbt makes a RPC call to node's FinalizePsbt and asserts.
 func (h *HarnessRPC) FinalizePsbt(
 	req *walletrpc.FinalizePsbtRequest) *walletrpc.FinalizePsbtResponse {
@@ -240,6 +250,21 @@ func (h *HarnessRPC) BumpFee(
 
 	resp, err := h.WalletKit.BumpFee(ctxt, req)
 	h.NoError(err, "BumpFee")
+
+	return resp
+}
+
+// BumpForceCloseFee makes a RPC call to the node's WalletKitClient and asserts.
+//
+//nolint:lll
+func (h *HarnessRPC) BumpForceCloseFee(
+	req *walletrpc.BumpForceCloseFeeRequest) *walletrpc.BumpForceCloseFeeResponse {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.WalletKit.BumpForceCloseFee(ctxt, req)
+	h.NoError(err, "BumpForceCloseFee")
 
 	return resp
 }

@@ -16,6 +16,39 @@
     "application/json"
   ],
   "paths": {
+    "/v2/wallet/BumpForceCloseFee": {
+      "post": {
+        "summary": "lncli: `wallet bumpforceclosefee`\nBumpForceCloseFee is an endpoint that allows users to bump the fee of a\nchannel force close. This only works for channels with option_anchors.",
+        "operationId": "WalletKit_BumpForceCloseFee",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/walletrpcBumpForceCloseFeeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/walletrpcBumpForceCloseFeeRequest"
+            }
+          }
+        ],
+        "tags": [
+          "WalletKit"
+        ]
+      }
+    },
     "/v2/wallet/accounts": {
       "get": {
         "summary": "lncli: `wallet accounts list`\nListAccounts retrieves all accounts belonging to the wallet by default. A\nname and key scope filter can be provided to filter through all of the\nwallet accounts and return only those matching.",
@@ -239,8 +272,8 @@
     },
     "/v2/wallet/bumpfee": {
       "post": {
-        "summary": "lncli: `wallet bumpfee`\nBumpFee bumps the fee of an arbitrary input within a transaction. This RPC\ntakes a different approach than bitcoind's bumpfee command. lnd has a\ncentral batching engine in which inputs with similar fee rates are batched\ntogether to save on transaction fees. Due to this, we cannot rely on\nbumping the fee on a specific transaction, since transactions can change at\nany point with the addition of new inputs. The list of inputs that\ncurrently exist within lnd's central batching engine can be retrieved\nthrough the PendingSweeps RPC.",
-        "description": "When bumping the fee of an input that currently exists within lnd's central\nbatching engine, a higher fee transaction will be created that replaces the\nlower fee transaction through the Replace-By-Fee (RBF) policy. If it\n\nThis RPC also serves useful when wanting to perform a Child-Pays-For-Parent\n(CPFP), where the child transaction pays for its parent's fee. This can be\ndone by specifying an outpoint within the low fee transaction that is under\nthe control of the wallet.\n\nThe fee preference can be expressed either as a specific fee rate or a delta\nof blocks in which the output should be swept on-chain within. If a fee\npreference is not explicitly specified, then an error is returned.\n\nNote that this RPC currently doesn't perform any validation checks on the\nfee preference being provided. For now, the responsibility of ensuring that\nthe new fee preference is sufficient is delegated to the user.",
+        "summary": "lncli: `wallet bumpfee`\nBumpFee is an endpoint that allows users to interact with lnd's sweeper\ndirectly. It takes an outpoint from an unconfirmed transaction and sends it\nto the sweeper for potential fee bumping. Depending on whether the outpoint\nhas been registered in the sweeper (an existing input, e.g., an anchor\noutput) or not (a new input, e.g., an unconfirmed wallet utxo), this will\neither be an RBF or CPFP attempt.",
+        "description": "When receiving an input, lnd’s sweeper needs to understand its time\nsensitivity to make economical fee bumps - internally a fee function is\ncreated using the deadline and budget to guide the process. When the\ndeadline is approaching, the fee function will increase the fee rate and\nperform an RBF.\n\nWhen a force close happens, all the outputs from the force closing\ntransaction will be registered in the sweeper. The sweeper will then handle\nthe creation, publish, and fee bumping of the sweeping transactions.\nEverytime a new block comes in, unless the sweeping transaction is\nconfirmed, an RBF is attempted. To interfere with this automatic process,\nusers can use BumpFee to specify customized fee rate, budget, deadline, and\nwhether the sweep should happen immediately. It's recommended to call\n`ListSweeps` to understand the shape of the existing sweeping transaction\nfirst - depending on the number of inputs in this transaction, the RBF\nrequirements can be quite different.\n\nThis RPC also serves useful when wanting to perform a Child-Pays-For-Parent\n(CPFP), where the child transaction pays for its parent's fee. This can be\ndone by specifying an outpoint within the low fee transaction that is under\nthe control of the wallet.",
         "operationId": "WalletKit_BumpFee",
         "responses": {
           "200": {
@@ -768,7 +801,7 @@
     },
     "/v2/wallet/tx/label": {
       "post": {
-        "summary": "lncli: `wallet labeltx`\nLabelTransaction adds a label to a transaction. If the transaction already\nhas a label the call will fail unless the overwrite bool is set. This will\noverwrite the exiting transaction label. Labels must not be empty, and\ncannot exceed 500 characters.",
+        "summary": "lncli: `wallet labeltx`\nLabelTransaction adds a label to a transaction. If the transaction already\nhas a label the call will fail unless the overwrite bool is set. This will\noverwrite the existing transaction label. Labels must not be empty, and\ncannot exceed 500 characters.",
         "operationId": "WalletKit_LabelTransaction",
         "responses": {
           "200": {
@@ -948,6 +981,25 @@
       "default": "WITNESS_PUBKEY_HASH",
       "description": "- `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)\n- `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)\n- `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)",
       "title": "`AddressType` has to be one of:"
+    },
+    "lnrpcChannelPoint": {
+      "type": "object",
+      "properties": {
+        "funding_txid_bytes": {
+          "type": "string",
+          "format": "byte",
+          "description": "Txid of the funding transaction. When using REST, this field must be\nencoded as base64."
+        },
+        "funding_txid_str": {
+          "type": "string",
+          "description": "Hex-encoded string representing the byte-reversed hash of the funding\ntransaction."
+        },
+        "output_index": {
+          "type": "integer",
+          "format": "int64",
+          "title": "The index of the output of the funding transaction"
+        }
+      }
     },
     "lnrpcCoinSelectionStrategy": {
       "type": "string",
@@ -1360,7 +1412,7 @@
         "target_conf": {
           "type": "integer",
           "format": "int64",
-          "description": "The target number of blocks that the input should be spent within."
+          "description": "Optional. The deadline in number of blocks that the input should be spent\nwithin. When not set, for new inputs, the default value (1008) is used;\nfor existing inputs, their current values will be retained."
         },
         "sat_per_byte": {
           "type": "integer",
@@ -1369,12 +1421,21 @@
         },
         "force": {
           "type": "boolean",
-          "description": "Whether this input must be force-swept. This means that it is swept even\nif it has a negative yield."
+          "description": "Deprecated, use immediate.\nWhether this input must be force-swept. This means that it is swept\nimmediately."
         },
         "sat_per_vbyte": {
           "type": "string",
           "format": "uint64",
-          "description": "The fee rate, expressed in sat/vbyte, that should be used to spend the input\nwith."
+          "description": "Optional. The starting fee rate, expressed in sat/vbyte, that will be used\nto spend the input with initially. This value will be used by the sweeper's\nfee function as its starting fee rate. When not set, the sweeper will use\nthe estimated fee rate using the `target_conf` as the starting fee rate."
+        },
+        "immediate": {
+          "type": "boolean",
+          "description": "Optional. Whether this input will be swept immediately. When set to true,\nthe sweeper will sweep this input without waiting for the next batch."
+        },
+        "budget": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Optional. The max amount in sats that can be used as the fees. Setting this\nvalue greater than the input's value may result in CPFP - one or more wallet\nutxos will be used to pay the fees specified by the budget. If not set, for\nnew inputs, by default 50% of the input's value will be treated as the\nbudget for fee bumping; for existing inputs, their current budgets will be\nretained."
         }
       }
     },
@@ -1384,6 +1445,43 @@
         "status": {
           "type": "string",
           "description": "The status of the bump fee operation."
+        }
+      }
+    },
+    "walletrpcBumpForceCloseFeeRequest": {
+      "type": "object",
+      "properties": {
+        "chan_point": {
+          "$ref": "#/definitions/lnrpcChannelPoint",
+          "description": "The channel point which force close transaction we are attempting to\nbump the fee rate for."
+        },
+        "deadline_delta": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Optional. The deadline delta in number of blocks that the anchor output\nshould be spent within to bump the closing transaction."
+        },
+        "starting_feerate": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Optional. The starting fee rate, expressed in sat/vbyte. This value will be\nused by the sweeper's fee function as its starting fee rate. When not set,\nthe sweeper will use the estimated fee rate using the target_conf as the\nstarting fee rate."
+        },
+        "immediate": {
+          "type": "boolean",
+          "description": "Optional. Whether this cpfp transaction will be triggered immediately. When\nset to true, the sweeper will consider all currently registered sweeps and\ntrigger new batch transactions including the sweeping of the anchor output\nrelated to the selected force close transaction."
+        },
+        "budget": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Optional. The max amount in sats that can be used as the fees. For already\nregistered anchor outputs if not set explicitly the old value will be used.\nFor channel force closes which have no HTLCs in their commitment transaction\nthis value has to be set to an appropriate amount to pay for the cpfp\ntransaction of the force closed channel otherwise the fee bumping will fail."
+        }
+      }
+    },
+    "walletrpcBumpForceCloseFeeResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the force close fee bump operation."
         }
       }
     },
@@ -1403,6 +1501,11 @@
           "type": "string",
           "format": "int64",
           "description": "The amount of satoshis per kw that should be used in order to reach the\nconfirmation target in the request."
+        },
+        "min_relay_fee_sat_per_kw": {
+          "type": "string",
+          "format": "int64",
+          "description": "The current minimum relay fee based on our chain backend in sat/kw."
         }
       }
     },
@@ -1792,12 +1895,16 @@
         "next_broadcast_height": {
           "type": "integer",
           "format": "int64",
-          "description": "The next height of the chain at which we'll attempt to broadcast the\nsweep transaction of the output."
+          "description": "Deprecated.\nThe next height of the chain at which we'll attempt to broadcast the\nsweep transaction of the output."
+        },
+        "force": {
+          "type": "boolean",
+          "description": "Deprecated, use immediate.\nWhether this input must be force-swept. This means that it is swept\nimmediately."
         },
         "requested_conf_target": {
           "type": "integer",
           "format": "int64",
-          "description": "The requested confirmation target for this output."
+          "description": "Deprecated, use deadline.\nThe requested confirmation target for this output, which is the deadline\nused by the sweeper."
         },
         "requested_sat_per_byte": {
           "type": "integer",
@@ -1807,16 +1914,26 @@
         "sat_per_vbyte": {
           "type": "string",
           "format": "uint64",
-          "description": "The fee rate we'll use to sweep the output, expressed in sat/vbyte. The fee\nrate is only determined once a sweeping transaction for the output is\ncreated, so it's possible for this to be 0 before this."
+          "description": "The current fee rate we'll use to sweep the output, expressed in sat/vbyte.\nThe fee rate is only determined once a sweeping transaction for the output\nis created, so it's possible for this to be 0 before this."
         },
         "requested_sat_per_vbyte": {
           "type": "string",
           "format": "uint64",
-          "description": "The requested fee rate, expressed in sat/vbyte, for this output."
+          "description": "The requested starting fee rate, expressed in sat/vbyte, for this\noutput. When not requested, this field will be 0."
         },
-        "force": {
+        "immediate": {
           "type": "boolean",
-          "description": "Whether this input must be force-swept. This means that it is swept even\nif it has a negative yield."
+          "description": "Whether this input will be swept immediately."
+        },
+        "budget": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The budget for this sweep, expressed in satoshis. This is the maximum amount\nthat can be spent as fees to sweep this output."
+        },
+        "deadline_height": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The deadline height used for this output when perform fee bumping."
         }
       }
     },

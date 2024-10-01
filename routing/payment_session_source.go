@@ -4,21 +4,24 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/lightningnetwork/lnd/zpay32"
 )
 
-// A compile time assertion to ensure MissionControl meets the
+// A compile time assertion to ensure SessionSource meets the
 // PaymentSessionSource interface.
 var _ PaymentSessionSource = (*SessionSource)(nil)
 
 // SessionSource defines a source for the router to retrieve new payment
 // sessions.
 type SessionSource struct {
-	// Graph is the channel graph that will be used to gather metrics from
-	// and also to carry out path finding queries.
-	Graph *channeldb.ChannelGraph
+	// GraphSessionFactory can be used to gain access to a Graph session.
+	// If the backing DB allows it, this will mean that a read transaction
+	// is being held during the use of the session.
+	GraphSessionFactory GraphSessionFactory
 
 	// SourceNode is the graph's source node.
 	SourceNode *channeldb.LightningNode
@@ -37,44 +40,31 @@ type SessionSource struct {
 	// then take into account this set of pruned vertexes/edges to reduce
 	// route failure and pass on graph information gained to the next
 	// execution.
-	MissionControl MissionController
+	MissionControl MissionControlQuerier
 
 	// PathFindingConfig defines global parameters that control the
 	// trade-off in path finding between fees and probability.
 	PathFindingConfig PathFindingConfig
 }
 
-// getRoutingGraph returns a routing graph and a clean-up function for
-// pathfinding.
-func (m *SessionSource) getRoutingGraph() (routingGraph, func(), error) {
-	routingTx, err := NewCachedGraph(m.SourceNode, m.Graph)
-	if err != nil {
-		return nil, nil, err
-	}
-	return routingTx, func() {
-		err := routingTx.Close()
-		if err != nil {
-			log.Errorf("Error closing db tx: %v", err)
-		}
-	}, nil
-}
-
 // NewPaymentSession creates a new payment session backed by the latest prune
 // view from Mission Control. An optional set of routing hints can be provided
 // in order to populate additional edges to explore when finding a path to the
 // payment's destination.
-func (m *SessionSource) NewPaymentSession(p *LightningPayment) (
-	PaymentSession, error) {
+func (m *SessionSource) NewPaymentSession(p *LightningPayment,
+	firstHopBlob fn.Option[tlv.Blob],
+	trafficShaper fn.Option[TlvTrafficShaper]) (PaymentSession, error) {
 
-	getBandwidthHints := func(graph routingGraph) (bandwidthHints, error) {
+	getBandwidthHints := func(graph Graph) (bandwidthHints, error) {
 		return newBandwidthManager(
 			graph, m.SourceNode.PubKeyBytes, m.GetLink,
+			firstHopBlob, trafficShaper,
 		)
 	}
 
 	session, err := newPaymentSession(
-		p, getBandwidthHints, m.getRoutingGraph,
-		m.MissionControl, m.PathFindingConfig,
+		p, m.SourceNode.PubKeyBytes, getBandwidthHints,
+		m.GraphSessionFactory, m.MissionControl, m.PathFindingConfig,
 	)
 	if err != nil {
 		return nil, err

@@ -179,32 +179,39 @@ type WalletKitClient interface {
 	// the UtxoSweeper, so things may change.
 	PendingSweeps(ctx context.Context, in *PendingSweepsRequest, opts ...grpc.CallOption) (*PendingSweepsResponse, error)
 	// lncli: `wallet bumpfee`
-	// BumpFee bumps the fee of an arbitrary input within a transaction. This RPC
-	// takes a different approach than bitcoind's bumpfee command. lnd has a
-	// central batching engine in which inputs with similar fee rates are batched
-	// together to save on transaction fees. Due to this, we cannot rely on
-	// bumping the fee on a specific transaction, since transactions can change at
-	// any point with the addition of new inputs. The list of inputs that
-	// currently exist within lnd's central batching engine can be retrieved
-	// through the PendingSweeps RPC.
+	// BumpFee is an endpoint that allows users to interact with lnd's sweeper
+	// directly. It takes an outpoint from an unconfirmed transaction and sends it
+	// to the sweeper for potential fee bumping. Depending on whether the outpoint
+	// has been registered in the sweeper (an existing input, e.g., an anchor
+	// output) or not (a new input, e.g., an unconfirmed wallet utxo), this will
+	// either be an RBF or CPFP attempt.
 	//
-	// When bumping the fee of an input that currently exists within lnd's central
-	// batching engine, a higher fee transaction will be created that replaces the
-	// lower fee transaction through the Replace-By-Fee (RBF) policy. If it
+	// When receiving an input, lnd’s sweeper needs to understand its time
+	// sensitivity to make economical fee bumps - internally a fee function is
+	// created using the deadline and budget to guide the process. When the
+	// deadline is approaching, the fee function will increase the fee rate and
+	// perform an RBF.
+	//
+	// When a force close happens, all the outputs from the force closing
+	// transaction will be registered in the sweeper. The sweeper will then handle
+	// the creation, publish, and fee bumping of the sweeping transactions.
+	// Everytime a new block comes in, unless the sweeping transaction is
+	// confirmed, an RBF is attempted. To interfere with this automatic process,
+	// users can use BumpFee to specify customized fee rate, budget, deadline, and
+	// whether the sweep should happen immediately. It's recommended to call
+	// `ListSweeps` to understand the shape of the existing sweeping transaction
+	// first - depending on the number of inputs in this transaction, the RBF
+	// requirements can be quite different.
 	//
 	// This RPC also serves useful when wanting to perform a Child-Pays-For-Parent
 	// (CPFP), where the child transaction pays for its parent's fee. This can be
 	// done by specifying an outpoint within the low fee transaction that is under
 	// the control of the wallet.
-	//
-	// The fee preference can be expressed either as a specific fee rate or a delta
-	// of blocks in which the output should be swept on-chain within. If a fee
-	// preference is not explicitly specified, then an error is returned.
-	//
-	// Note that this RPC currently doesn't perform any validation checks on the
-	// fee preference being provided. For now, the responsibility of ensuring that
-	// the new fee preference is sufficient is delegated to the user.
 	BumpFee(ctx context.Context, in *BumpFeeRequest, opts ...grpc.CallOption) (*BumpFeeResponse, error)
+	// lncli: `wallet bumpforceclosefee`
+	// BumpForceCloseFee is an endpoint that allows users to bump the fee of a
+	// channel force close. This only works for channels with option_anchors.
+	BumpForceCloseFee(ctx context.Context, in *BumpForceCloseFeeRequest, opts ...grpc.CallOption) (*BumpForceCloseFeeResponse, error)
 	// lncli: `wallet listsweeps`
 	// ListSweeps returns a list of the sweep transactions our node has produced.
 	// Note that these sweeps may not be confirmed yet, as we record sweeps on
@@ -213,7 +220,7 @@ type WalletKitClient interface {
 	// lncli: `wallet labeltx`
 	// LabelTransaction adds a label to a transaction. If the transaction already
 	// has a label the call will fail unless the overwrite bool is set. This will
-	// overwrite the exiting transaction label. Labels must not be empty, and
+	// overwrite the existing transaction label. Labels must not be empty, and
 	// cannot exceed 500 characters.
 	LabelTransaction(ctx context.Context, in *LabelTransactionRequest, opts ...grpc.CallOption) (*LabelTransactionResponse, error)
 	// lncli: `wallet psbt fund`
@@ -479,6 +486,15 @@ func (c *walletKitClient) BumpFee(ctx context.Context, in *BumpFeeRequest, opts 
 	return out, nil
 }
 
+func (c *walletKitClient) BumpForceCloseFee(ctx context.Context, in *BumpForceCloseFeeRequest, opts ...grpc.CallOption) (*BumpForceCloseFeeResponse, error) {
+	out := new(BumpForceCloseFeeResponse)
+	err := c.cc.Invoke(ctx, "/walletrpc.WalletKit/BumpForceCloseFee", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *walletKitClient) ListSweeps(ctx context.Context, in *ListSweepsRequest, opts ...grpc.CallOption) (*ListSweepsResponse, error) {
 	out := new(ListSweepsResponse)
 	err := c.cc.Invoke(ctx, "/walletrpc.WalletKit/ListSweeps", in, out, opts...)
@@ -687,32 +703,39 @@ type WalletKitServer interface {
 	// the UtxoSweeper, so things may change.
 	PendingSweeps(context.Context, *PendingSweepsRequest) (*PendingSweepsResponse, error)
 	// lncli: `wallet bumpfee`
-	// BumpFee bumps the fee of an arbitrary input within a transaction. This RPC
-	// takes a different approach than bitcoind's bumpfee command. lnd has a
-	// central batching engine in which inputs with similar fee rates are batched
-	// together to save on transaction fees. Due to this, we cannot rely on
-	// bumping the fee on a specific transaction, since transactions can change at
-	// any point with the addition of new inputs. The list of inputs that
-	// currently exist within lnd's central batching engine can be retrieved
-	// through the PendingSweeps RPC.
+	// BumpFee is an endpoint that allows users to interact with lnd's sweeper
+	// directly. It takes an outpoint from an unconfirmed transaction and sends it
+	// to the sweeper for potential fee bumping. Depending on whether the outpoint
+	// has been registered in the sweeper (an existing input, e.g., an anchor
+	// output) or not (a new input, e.g., an unconfirmed wallet utxo), this will
+	// either be an RBF or CPFP attempt.
 	//
-	// When bumping the fee of an input that currently exists within lnd's central
-	// batching engine, a higher fee transaction will be created that replaces the
-	// lower fee transaction through the Replace-By-Fee (RBF) policy. If it
+	// When receiving an input, lnd’s sweeper needs to understand its time
+	// sensitivity to make economical fee bumps - internally a fee function is
+	// created using the deadline and budget to guide the process. When the
+	// deadline is approaching, the fee function will increase the fee rate and
+	// perform an RBF.
+	//
+	// When a force close happens, all the outputs from the force closing
+	// transaction will be registered in the sweeper. The sweeper will then handle
+	// the creation, publish, and fee bumping of the sweeping transactions.
+	// Everytime a new block comes in, unless the sweeping transaction is
+	// confirmed, an RBF is attempted. To interfere with this automatic process,
+	// users can use BumpFee to specify customized fee rate, budget, deadline, and
+	// whether the sweep should happen immediately. It's recommended to call
+	// `ListSweeps` to understand the shape of the existing sweeping transaction
+	// first - depending on the number of inputs in this transaction, the RBF
+	// requirements can be quite different.
 	//
 	// This RPC also serves useful when wanting to perform a Child-Pays-For-Parent
 	// (CPFP), where the child transaction pays for its parent's fee. This can be
 	// done by specifying an outpoint within the low fee transaction that is under
 	// the control of the wallet.
-	//
-	// The fee preference can be expressed either as a specific fee rate or a delta
-	// of blocks in which the output should be swept on-chain within. If a fee
-	// preference is not explicitly specified, then an error is returned.
-	//
-	// Note that this RPC currently doesn't perform any validation checks on the
-	// fee preference being provided. For now, the responsibility of ensuring that
-	// the new fee preference is sufficient is delegated to the user.
 	BumpFee(context.Context, *BumpFeeRequest) (*BumpFeeResponse, error)
+	// lncli: `wallet bumpforceclosefee`
+	// BumpForceCloseFee is an endpoint that allows users to bump the fee of a
+	// channel force close. This only works for channels with option_anchors.
+	BumpForceCloseFee(context.Context, *BumpForceCloseFeeRequest) (*BumpForceCloseFeeResponse, error)
 	// lncli: `wallet listsweeps`
 	// ListSweeps returns a list of the sweep transactions our node has produced.
 	// Note that these sweeps may not be confirmed yet, as we record sweeps on
@@ -721,7 +744,7 @@ type WalletKitServer interface {
 	// lncli: `wallet labeltx`
 	// LabelTransaction adds a label to a transaction. If the transaction already
 	// has a label the call will fail unless the overwrite bool is set. This will
-	// overwrite the exiting transaction label. Labels must not be empty, and
+	// overwrite the existing transaction label. Labels must not be empty, and
 	// cannot exceed 500 characters.
 	LabelTransaction(context.Context, *LabelTransactionRequest) (*LabelTransactionResponse, error)
 	// lncli: `wallet psbt fund`
@@ -851,6 +874,9 @@ func (UnimplementedWalletKitServer) PendingSweeps(context.Context, *PendingSweep
 }
 func (UnimplementedWalletKitServer) BumpFee(context.Context, *BumpFeeRequest) (*BumpFeeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method BumpFee not implemented")
+}
+func (UnimplementedWalletKitServer) BumpForceCloseFee(context.Context, *BumpForceCloseFeeRequest) (*BumpForceCloseFeeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BumpForceCloseFee not implemented")
 }
 func (UnimplementedWalletKitServer) ListSweeps(context.Context, *ListSweepsRequest) (*ListSweepsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListSweeps not implemented")
@@ -1276,6 +1302,24 @@ func _WalletKit_BumpFee_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WalletKit_BumpForceCloseFee_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BumpForceCloseFeeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WalletKitServer).BumpForceCloseFee(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/walletrpc.WalletKit/BumpForceCloseFee",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WalletKitServer).BumpForceCloseFee(ctx, req.(*BumpForceCloseFeeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _WalletKit_ListSweeps_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListSweepsRequest)
 	if err := dec(in); err != nil {
@@ -1460,6 +1504,10 @@ var WalletKit_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BumpFee",
 			Handler:    _WalletKit_BumpFee_Handler,
+		},
+		{
+			MethodName: "BumpForceCloseFee",
+			Handler:    _WalletKit_BumpForceCloseFee_Handler,
 		},
 		{
 			MethodName: "ListSweeps",

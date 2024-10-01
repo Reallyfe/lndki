@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -27,6 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
@@ -35,6 +35,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/ticker"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 func isAlias(scid lnwire.ShortChannelID) bool {
@@ -81,6 +82,7 @@ func (m *mockPreimageCache) SubscribeUpdates(
 	return nil, nil
 }
 
+// TODO(yy): replace it with chainfee.MockEstimator.
 type mockFeeEstimator struct {
 	byteFeeIn chan chainfee.SatPerKWeight
 	relayFee  chan chainfee.SatPerKWeight
@@ -165,7 +167,7 @@ type mockServer struct {
 var _ lnpeer.Peer = (*mockServer)(nil)
 
 func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) {
-	signAliasUpdate := func(u *lnwire.ChannelUpdate) (*ecdsa.Signature,
+	signAliasUpdate := func(u *lnwire.ChannelUpdate1) (*ecdsa.Signature,
 		error) {
 
 		return testSig, nil
@@ -181,9 +183,9 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 			events: make(map[time.Time]channeldb.ForwardingEvent),
 		},
 		FetchLastChannelUpdate: func(scid lnwire.ShortChannelID) (
-			*lnwire.ChannelUpdate, error) {
+			*lnwire.ChannelUpdate1, error) {
 
-			return &lnwire.ChannelUpdate{
+			return &lnwire.ChannelUpdate1{
 				ShortChannelID: scid,
 			}, nil
 		},
@@ -200,7 +202,7 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 		HtlcNotifier:           &mockHTLCNotifier{},
 		Clock:                  clock.NewDefaultClock(),
 		MailboxDeliveryTimeout: time.Hour,
-		DustThreshold:          DefaultDustThreshold,
+		MaxFeeExposure:         DefaultMaxFeeExposure,
 		SignAliasUpdate:        signAliasUpdate,
 		IsAlias:                isAlias,
 	}
@@ -330,10 +332,10 @@ func newMockHopIterator(hops ...*hop.Payload) hop.Iterator {
 	return &mockHopIterator{hops: hops}
 }
 
-func (r *mockHopIterator) HopPayload() (*hop.Payload, error) {
+func (r *mockHopIterator) HopPayload() (*hop.Payload, hop.RouteRole, error) {
 	h := r.hops[0]
 	r.hops = r.hops[1:]
-	return h, nil
+	return h, hop.RouteRoleCleartext, nil
 }
 
 func (r *mockHopIterator) ExtraOnionBlob() []byte {
@@ -341,7 +343,7 @@ func (r *mockHopIterator) ExtraOnionBlob() []byte {
 }
 
 func (r *mockHopIterator) ExtractErrorEncrypter(
-	extracter hop.ErrorEncrypterExtracter) (hop.ErrorEncrypter,
+	extracter hop.ErrorEncrypterExtracter, _ bool) (hop.ErrorEncrypter,
 	lnwire.FailCode) {
 
 	return extracter(nil)
@@ -683,6 +685,8 @@ func (s *mockServer) RemoteFeatures() *lnwire.FeatureVector {
 	return nil
 }
 
+func (s *mockServer) Disconnect(err error) {}
+
 func (s *mockServer) Stop() error {
 	if !atomic.CompareAndSwapInt32(&s.shutdown, 0, 1) {
 		return nil
@@ -731,7 +735,7 @@ type mockChannelLink struct {
 	checkHtlcForwardResult *LinkError
 
 	failAliasUpdate func(sid lnwire.ShortChannelID,
-		incoming bool) *lnwire.ChannelUpdate
+		incoming bool) *lnwire.ChannelUpdate1
 
 	confirmedZC bool
 }
@@ -813,7 +817,9 @@ func (f *mockChannelLink) handleSwitchPacket(pkt *htlcPacket) error {
 	return nil
 }
 
-func (f *mockChannelLink) getDustSum(remote bool) lnwire.MilliSatoshi {
+func (f *mockChannelLink) getDustSum(whoseCommit lntypes.ChannelParty,
+	dryRunFee fn.Option[chainfee.SatPerKWeight]) lnwire.MilliSatoshi {
+
 	return 0
 }
 
@@ -826,6 +832,10 @@ func (f *mockChannelLink) getDustClosure() dustClosure {
 	return dustHelper(
 		channeldb.SingleFunderTweaklessBit, dustLimit, dustLimit,
 	)
+}
+
+func (f *mockChannelLink) getCommitFee(remote bool) btcutil.Amount {
+	return 0
 }
 
 func (f *mockChannelLink) HandleChannelUpdate(lnwire.Message) {
@@ -860,7 +870,7 @@ func (f *mockChannelLink) AttachMailBox(mailBox MailBox) {
 }
 
 func (f *mockChannelLink) attachFailAliasUpdate(closure func(
-	sid lnwire.ShortChannelID, incoming bool) *lnwire.ChannelUpdate) {
+	sid lnwire.ShortChannelID, incoming bool) *lnwire.ChannelUpdate1) {
 
 	f.failAliasUpdate = closure
 }
@@ -941,12 +951,20 @@ func (f *mockChannelLink) OnCommitOnce(LinkDirection, func()) {
 	// TODO(proofofkeags): Implement
 }
 
+func (f *mockChannelLink) FundingCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+func (f *mockChannelLink) CommitmentCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
 var _ ChannelLink = (*mockChannelLink)(nil)
 
 func newDB() (*channeldb.DB, func(), error) {
 	// First, create a temporary directory to be used for the duration of
 	// this test.
-	tempDirName, err := ioutil.TempDir("", "channeldb")
+	tempDirName, err := os.MkdirTemp("", "channeldb")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -996,6 +1014,7 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		panic(err)
 	}
 
+	modifierMock := &invoices.MockHtlcModifier{}
 	registry := invoices.NewRegistry(
 		cdb,
 		invoices.NewInvoiceExpiryWatcher(
@@ -1004,6 +1023,7 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		),
 		&invoices.RegistryConfig{
 			FinalCltvRejectDelta: 5,
+			HtlcInterceptor:      modifierMock,
 		},
 	)
 	registry.Start()
@@ -1029,11 +1049,12 @@ func (i *mockInvoiceRegistry) SettleHodlInvoice(
 func (i *mockInvoiceRegistry) NotifyExitHopHtlc(rhash lntypes.Hash,
 	amt lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
 	circuitKey models.CircuitKey, hodlChan chan<- interface{},
+	wireCustomRecords lnwire.CustomRecords,
 	payload invoices.Payload) (invoices.HtlcResolution, error) {
 
 	event, err := i.registry.NotifyExitHopHtlc(
-		rhash, amt, expiry, currentHeight, circuitKey, hodlChan,
-		payload,
+		rhash, amt, expiry, currentHeight, circuitKey,
+		hodlChan, wireCustomRecords, payload,
 	)
 	if err != nil {
 		return nil, err
@@ -1143,22 +1164,27 @@ type mockHTLCNotifier struct {
 }
 
 func (h *mockHTLCNotifier) NotifyForwardingEvent(key HtlcKey, info HtlcInfo,
-	eventType HtlcEventType) { //nolint:whitespace
+	eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyLinkFailEvent(key HtlcKey, info HtlcInfo,
 	eventType HtlcEventType, linkErr *LinkError,
-	incoming bool) { //nolint:whitespace
+	incoming bool) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyForwardingFailEvent(key HtlcKey,
-	eventType HtlcEventType) { //nolint:whitespace
+	eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifySettleEvent(key HtlcKey,
-	preimage lntypes.Preimage, eventType HtlcEventType) { //nolint:whitespace,lll
+	preimage lntypes.Preimage, eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyFinalHtlcEvent(key models.CircuitKey,
-	info channeldb.FinalHtlcInfo) { //nolint:whitespace
+	info channeldb.FinalHtlcInfo) {
+
 }

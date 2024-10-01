@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"os/user"
@@ -38,11 +38,11 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/peersrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/signal"
-	"github.com/lightningnetwork/lnd/sweep"
 	"github.com/lightningnetwork/lnd/tor"
 )
 
@@ -59,6 +59,7 @@ const (
 	defaultLogLevel           = "info"
 	defaultLogDirname         = "logs"
 	defaultLogFilename        = "lnd.log"
+	defaultLogCompressor      = build.Gzip
 	defaultRPCPort            = 10009
 	defaultRESTPort           = 8080
 	defaultPeerPort           = 9735
@@ -168,6 +169,17 @@ const (
 	defaultRSTimeout  = time.Second * 1
 	defaultRSBackoff  = time.Second * 30
 	defaultRSAttempts = 1
+
+	// Set defaults for a health check which ensures that the leader
+	// election is functioning correctly. Although this check is off by
+	// default (as etcd leader election is only used in a clustered setup),
+	// we still set the default values so that the health check can be
+	// easily enabled with sane defaults. Note that by default we only run
+	// this check once, as it is critical for the node's operation.
+	defaultLeaderCheckInterval = time.Minute
+	defaultLeaderCheckTimeout  = time.Second * 5
+	defaultLeaderCheckBackoff  = time.Second * 5
+	defaultLeaderCheckAttempts = 1
 
 	// defaultRemoteMaxHtlcs specifies the default limit for maximum
 	// concurrent HTLCs the remote party may add to commitment transactions.
@@ -304,6 +316,7 @@ type Config struct {
 	ReadMacPath     string        `long:"readonlymacaroonpath" description:"Path to write the read-only macaroon for lnd's RPC and REST services if it doesn't exist"`
 	InvoiceMacPath  string        `long:"invoicemacaroonpath" description:"Path to the invoice-only macaroon for lnd's RPC and REST services if it doesn't exist"`
 	LogDir          string        `long:"logdir" description:"Directory to log output."`
+	LogCompressor   string        `long:"logcompressor" description:"Compression algorithm to use when rotating logs." choice:"gzip" choice:"zstd"`
 	MaxLogFiles     int           `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation)"`
 	MaxLogFileSize  int           `long:"maxlogfilesize" description:"Maximum logfile size in MB"`
 	AcceptorTimeout time.Duration `long:"acceptortimeout" description:"Time after which an RPCAcceptor will time out and return false if it hasn't yet received a response"`
@@ -351,7 +364,7 @@ type Config struct {
 	MaxPendingChannels int    `long:"maxpendingchannels" description:"The maximum number of incoming pending channels permitted per peer."`
 	BackupFilePath     string `long:"backupfilepath" description:"The target location of the channel backup file"`
 
-	FeeURL string `long:"feeurl" description:"Optional URL for external fee estimation. If no URL is specified, the method for fee estimation will depend on the chosen backend and network. Must be set for neutrino on mainnet."`
+	FeeURL string `long:"feeurl" description:"DEPRECATED: Use 'fee.url' option. Optional URL for external fee estimation. If no URL is specified, the method for fee estimation will depend on the chosen backend and network. Must be set for neutrino on mainnet." hidden:"true"`
 
 	Bitcoin      *lncfg.Chain    `group:"Bitcoin" namespace:"bitcoin"`
 	BtcdMode     *lncfg.Btcd     `group:"btcd" namespace:"btcd"`
@@ -411,6 +424,8 @@ type Config struct {
 
 	RejectHTLC bool `long:"rejecthtlc" description:"If true, lnd will not forward any HTLCs that are meant as onward payments. This option will still allow lnd to send HTLCs and receive HTLCs but lnd won't be used as a hop."`
 
+	AcceptPositiveInboundFees bool `long:"accept-positive-inbound-fees" description:"If true, lnd will also allow setting positive inbound fees. By default, lnd only allows to set negative inbound fees (an inbound \"discount\") to remain backwards compatible with senders whose implementations do not yet support inbound fees."`
+
 	// RequireInterceptor determines whether the HTLC interceptor is
 	// registered regardless of whether the RPC is called or not.
 	RequireInterceptor bool `long:"requireinterceptor" description:"Whether to always intercept HTLCs, even if no stream is attached"`
@@ -439,7 +454,9 @@ type Config struct {
 
 	GcCanceledInvoicesOnTheFly bool `long:"gc-canceled-invoices-on-the-fly" description:"If true, we'll delete newly canceled invoices on the fly."`
 
-	DustThreshold uint64 `long:"dust-threshold" description:"Sets the dust sum threshold in satoshis for a channel after which dust HTLC's will be failed."`
+	MaxFeeExposure uint64 `long:"dust-threshold" description:"Sets the max fee exposure in satoshis for a channel after which HTLC's will be failed."`
+
+	Fee *lncfg.Fee `group:"fee" namespace:"fee"`
 
 	Invoices *lncfg.Invoices `group:"invoices" namespace:"invoices"`
 
@@ -545,6 +562,7 @@ func DefaultConfig() Config {
 		LetsEncryptDir:    defaultLetsEncryptDir,
 		LetsEncryptListen: defaultLetsEncryptListen,
 		LogDir:            defaultLogDir,
+		LogCompressor:     defaultLogCompressor,
 		MaxLogFiles:       defaultMaxLogFiles,
 		MaxLogFileSize:    defaultMaxLogFileSize,
 		AcceptorTimeout:   defaultAcceptorTimeout,
@@ -581,6 +599,12 @@ func DefaultConfig() Config {
 		MinBackoff:         defaultMinBackoff,
 		MaxBackoff:         defaultMaxBackoff,
 		ConnectionTimeout:  tor.DefaultConnTimeout,
+
+		Fee: &lncfg.Fee{
+			MinUpdateTimeout: lncfg.DefaultMinUpdateTimeout,
+			MaxUpdateTimeout: lncfg.DefaultMaxUpdateTimeout,
+		},
+
 		SubRPCServers: &subRPCServerConfigs{
 			SignRPC:   &signrpc.Config{},
 			RouterRPC: routerrpc.DefaultConfig(),
@@ -626,9 +650,8 @@ func DefaultConfig() Config {
 			RejectCacheSize:  channeldb.DefaultRejectCacheSize,
 			ChannelCacheSize: channeldb.DefaultChannelCacheSize,
 		},
-		Prometheus:      lncfg.DefaultPrometheus(),
-		Watchtower:      lncfg.DefaultWatchtowerCfg(defaultTowerDir),
-		ProtocolOptions: lncfg.DefaultProtocol(),
+		Prometheus: lncfg.DefaultPrometheus(),
+		Watchtower: lncfg.DefaultWatchtowerCfg(defaultTowerDir),
 		HealthChecks: &lncfg.HealthCheckConfig{
 			ChainCheck: &lncfg.CheckConfig{
 				Interval: defaultChainInterval,
@@ -663,6 +686,12 @@ func DefaultConfig() Config {
 				Attempts: defaultRSAttempts,
 				Backoff:  defaultRSBackoff,
 			},
+			LeaderCheck: &lncfg.CheckConfig{
+				Interval: defaultLeaderCheckInterval,
+				Timeout:  defaultLeaderCheckTimeout,
+				Attempts: defaultLeaderCheckAttempts,
+				Backoff:  defaultLeaderCheckBackoff,
+			},
 		},
 		Gossip: &lncfg.Gossip{
 			MaxChannelUpdateBurst: discovery.DefaultMaxChannelUpdateBurst,
@@ -672,10 +701,19 @@ func DefaultConfig() Config {
 		Invoices: &lncfg.Invoices{
 			HoldExpiryDelta: lncfg.DefaultHoldInvoiceExpiryDelta,
 		},
+		Routing: &lncfg.Routing{
+			BlindedPaths: lncfg.BlindedPaths{
+				MinNumRealHops:           lncfg.DefaultMinNumRealBlindedPathHops,
+				NumHops:                  lncfg.DefaultNumBlindedPathHops,
+				MaxNumPaths:              lncfg.DefaultMaxNumBlindedPaths,
+				PolicyIncreaseMultiplier: lncfg.DefaultBlindedPathPolicyIncreaseMultiplier,
+				PolicyDecreaseMultiplier: lncfg.DefaultBlindedPathPolicyDecreaseMultiplier,
+			},
+		},
 		MaxOutgoingCltvExpiry:     htlcswitch.DefaultMaxOutgoingCltvExpiry,
 		MaxChannelFeeAllocation:   htlcswitch.DefaultMaxLinkFeeAllocation,
 		MaxCommitFeeRateAnchors:   lnwallet.DefaultAnchorsCommitMaxFeeRateSatPerVByte,
-		DustThreshold:             uint64(htlcswitch.DefaultDustThreshold.ToSatoshis()),
+		MaxFeeExposure:            uint64(htlcswitch.DefaultMaxFeeExposure.ToSatoshis()),
 		LogWriter:                 build.NewRotatingLogWriter(),
 		DB:                        lncfg.DefaultDB(),
 		Cluster:                   lncfg.DefaultCluster(),
@@ -689,10 +727,7 @@ func DefaultConfig() Config {
 		RemoteSigner: &lncfg.RemoteSigner{
 			Timeout: lncfg.DefaultRemoteSignerRPCTimeout,
 		},
-		Sweeper: &lncfg.Sweeper{
-			BatchWindowDuration: sweep.DefaultBatchWindowDuration,
-			MaxFeeRate:          sweep.DefaultMaxFeeRate,
-		},
+		Sweeper: lncfg.DefaultSweeperConfig(),
 		Htlcswitch: &lncfg.Htlcswitch{
 			MailboxDeliveryTimeout: htlcswitch.DefaultMailboxDeliveryTimeout,
 		},
@@ -766,7 +801,9 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 		// If it's a parsing related error, then we'll return
 		// immediately, otherwise we can proceed as possibly the config
 		// file doesn't exist which is OK.
-		if _, ok := err.(*flags.IniError); ok {
+		if lnutils.ErrorAs[*flags.IniError](err) ||
+			lnutils.ErrorAs[*flags.Error](err) {
+
 			return nil, err
 		}
 
@@ -1412,11 +1449,16 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		os.Exit(0)
 	}
 
+	if !build.SuportedLogCompressor(cfg.LogCompressor) {
+		return nil, mkErr("invalid log compressor: %v",
+			cfg.LogCompressor)
+	}
+
 	// Initialize logging at the default logging level.
 	SetupLoggers(cfg.LogWriter, interceptor)
 	err = cfg.LogWriter.InitLogRotator(
 		filepath.Join(cfg.LogDir, defaultLogFilename),
-		cfg.MaxLogFileSize, cfg.MaxLogFiles,
+		cfg.LogCompressor, cfg.MaxLogFileSize, cfg.MaxLogFiles,
 	)
 	if err != nil {
 		str := "log rotation setup failed: %v"
@@ -1648,22 +1690,9 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		return nil, mkErr("error parsing gossip syncer: %v", err)
 	}
 
-	// Log a warning if our expiry delta is not greater than our incoming
-	// broadcast delta. We do not fail here because this value may be set
-	// to zero to intentionally keep lnd's behavior unchanged from when we
-	// didn't auto-cancel these invoices.
-	if cfg.Invoices.HoldExpiryDelta <= lncfg.DefaultIncomingBroadcastDelta {
-		ltndLog.Warnf("Invoice hold expiry delta: %v <= incoming "+
-			"delta: %v, accepted hold invoices will force close "+
-			"channels if they are not canceled manually",
-			cfg.Invoices.HoldExpiryDelta,
-			lncfg.DefaultIncomingBroadcastDelta)
-	}
-
 	// If the experimental protocol options specify any protocol messages
 	// that we want to handle as custom messages, set them now.
-	//nolint:lll
-	customMsg := cfg.ProtocolOptions.ExperimentalProtocol.CustomMessageOverrides()
+	customMsg := cfg.ProtocolOptions.CustomMessageOverrides()
 
 	// We can safely set our custom override values during startup because
 	// startup is blocked on config parsing.
@@ -1683,6 +1712,8 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.RemoteSigner,
 		cfg.Sweeper,
 		cfg.Htlcswitch,
+		cfg.Invoices,
+		cfg.Routing,
 	)
 	if err != nil {
 		return nil, err
@@ -1847,7 +1878,7 @@ func parseRPCParams(cConfig *lncfg.Chain, nodeConfig interface{},
 
 		// We convert the cookie into a user name and password.
 		if conf.RPCCookie != "" {
-			cookie, err := ioutil.ReadFile(conf.RPCCookie)
+			cookie, err := os.ReadFile(conf.RPCCookie)
 			if err != nil {
 				return fmt.Errorf("cannot read cookie file: %w",
 					err)
@@ -2008,7 +2039,7 @@ func extractBtcdRPCParams(btcdConfigPath string) (string, string, error) {
 
 	// With the file open extract the contents of the configuration file so
 	// we can attempt to locate the RPC credentials.
-	configContents, err := ioutil.ReadAll(btcdConfigFile)
+	configContents, err := io.ReadAll(btcdConfigFile)
 	if err != nil {
 		return "", "", err
 	}
@@ -2058,7 +2089,7 @@ func extractBitcoindRPCParams(networkName, bitcoindDataDir, bitcoindConfigPath,
 
 	// With the file open extract the contents of the configuration file so
 	// we can attempt to locate the RPC credentials.
-	configContents, err := ioutil.ReadAll(bitcoindConfigFile)
+	configContents, err := io.ReadAll(bitcoindConfigFile)
 	if err != nil {
 		return "", "", "", "", err
 	}
@@ -2120,7 +2151,7 @@ func extractBitcoindRPCParams(networkName, bitcoindDataDir, bitcoindConfigPath,
 	if rpcCookiePath != "" {
 		cookiePath = rpcCookiePath
 	}
-	cookie, err := ioutil.ReadFile(cookiePath)
+	cookie, err := os.ReadFile(cookiePath)
 	if err == nil {
 		splitCookie := strings.Split(string(cookie), ":")
 		if len(splitCookie) == 2 {

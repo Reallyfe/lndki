@@ -13,6 +13,7 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest/wait"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -52,10 +53,16 @@ func CopyFile(dest, src string) error {
 
 // errNumNotMatched is a helper method to return a nicely formatted error.
 func errNumNotMatched(name string, subject string,
-	want, got, total, old int) error {
+	want, got, total, old int, desc ...any) error {
 
-	return fmt.Errorf("%s: assert %s failed: want %d, got: %d, total: "+
+	err := fmt.Errorf("%s: assert %s failed: want %d, got: %d, total: "+
 		"%d, previously had: %d", name, subject, want, got, total, old)
+
+	if len(desc) > 0 {
+		err = fmt.Errorf("%w, desc: %v", err, desc)
+	}
+
+	return err
 }
 
 // parseDerivationPath parses a path in the form of m/x'/y'/z'/a/b into a slice
@@ -212,8 +219,9 @@ func CalcStaticFee(c lnrpc.CommitmentType, numHTLCs int) btcutil.Amount {
 		anchors = anchorSize
 	}
 
-	return feePerKw.FeeForWeight(int64(commitWeight+htlcWeight*numHTLCs)) +
-		anchors
+	totalWeight := commitWeight + htlcWeight*numHTLCs
+
+	return feePerKw.FeeForWeight(lntypes.WeightUnit(totalWeight)) + anchors
 }
 
 // CalculateMaxHtlc re-implements the RequiredRemoteChannelReserve of the
@@ -266,8 +274,10 @@ func CalcStaticFeeBuffer(c lnrpc.CommitmentType, numHTLCs int) btcutil.Amount {
 
 	// Account for the HTLC which will be required when sending an htlc.
 	numHTLCs++
+
+	totalWeight := commitWeight + numHTLCs*htlcWeight
 	feeBuffer := lnwallet.CalcFeeBuffer(
-		feePerKw, int64(commitWeight+numHTLCs*htlcWeight),
+		feePerKw, lntypes.WeightUnit(totalWeight),
 	)
 
 	return feeBuffer.ToSatoshis()

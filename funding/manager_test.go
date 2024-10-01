@@ -28,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/channelnotifier"
 	"github.com/lightningnetwork/lnd/discovery"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
@@ -161,7 +162,7 @@ func (m *mockAliasMgr) GetPeerAlias(lnwire.ChannelID) (lnwire.ShortChannelID,
 }
 
 func (m *mockAliasMgr) AddLocalAlias(lnwire.ShortChannelID,
-	lnwire.ShortChannelID, bool) error {
+	lnwire.ShortChannelID, bool, bool) error {
 
 	return nil
 }
@@ -282,6 +283,8 @@ type testNode struct {
 }
 
 var _ lnpeer.Peer = (*testNode)(nil)
+
+func (n *testNode) Disconnect(err error) {}
 
 func (n *testNode) IdentityKey() *btcec.PublicKey {
 	return n.addr.IdentityKey
@@ -556,6 +559,17 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 			return nil, nil
 		},
 		AliasManager: aliasMgr,
+		// For unit tests we default to false meaning that no funds
+		// originated from the sweeper.
+		IsSweeperOutpoint: func(wire.OutPoint) bool {
+			return false
+		},
+		AuxLeafStore: fn.Some[lnwallet.AuxLeafStore](
+			&lnwallet.MockAuxLeafStore{},
+		),
+		AuxSigner: fn.Some[lnwallet.AuxSigner](
+			&lnwallet.MockAuxSigner{},
+		),
 	}
 
 	for _, op := range options {
@@ -665,6 +679,8 @@ func recreateAliceFundingManager(t *testing.T, alice *testNode) {
 		OpenChannelPredicate:  chainedAcceptor,
 		DeleteAliasEdge:       oldCfg.DeleteAliasEdge,
 		AliasManager:          oldCfg.AliasManager,
+		AuxLeafStore:          oldCfg.AuxLeafStore,
+		AuxSigner:             oldCfg.AuxSigner,
 	})
 	require.NoError(t, err, "failed recreating aliceFundingManager")
 
@@ -1135,13 +1151,13 @@ func assertChannelReadySent(t *testing.T, alice, bob *testNode,
 	assertDatabaseState(t, bob, fundingOutPoint, channelReadySent)
 }
 
-func assertAddedToRouterGraph(t *testing.T, alice, bob *testNode,
+func assertAddedToGraph(t *testing.T, alice, bob *testNode,
 	fundingOutPoint *wire.OutPoint) {
 
 	t.Helper()
 
-	assertDatabaseState(t, alice, fundingOutPoint, addedToRouterGraph)
-	assertDatabaseState(t, bob, fundingOutPoint, addedToRouterGraph)
+	assertDatabaseState(t, alice, fundingOutPoint, addedToGraph)
+	assertDatabaseState(t, bob, fundingOutPoint, addedToGraph)
 }
 
 // assertChannelAnnouncements checks that alice and bob both sends the expected
@@ -1196,9 +1212,9 @@ func assertChannelAnnouncements(t *testing.T, alice, bob *testNode,
 		gotChannelUpdate := false
 		for _, msg := range announcements {
 			switch m := msg.(type) {
-			case *lnwire.ChannelAnnouncement:
+			case *lnwire.ChannelAnnouncement1:
 				gotChannelAnnouncement = true
-			case *lnwire.ChannelUpdate:
+			case *lnwire.ChannelUpdate1:
 
 				// The channel update sent by the node should
 				// advertise the MinHTLC value required by the
@@ -1285,7 +1301,7 @@ func assertAnnouncementSignatures(t *testing.T, alice, bob *testNode) {
 		gotNodeAnnouncement := false
 		for _, msg := range announcements {
 			switch msg.(type) {
-			case *lnwire.AnnounceSignatures:
+			case *lnwire.AnnounceSignatures1:
 				gotAnnounceSignatures = true
 			case *lnwire.NodeAnnouncement:
 				gotNodeAnnouncement = true
@@ -1518,7 +1534,7 @@ func testNormalWorkflow(t *testing.T, chanType *lnwire.ChannelType) {
 	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil, nil, nil)
 
 	// Check that the state machine is updated accordingly
-	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
+	assertAddedToGraph(t, alice, bob, fundingOutPoint)
 
 	// The funding transaction is now confirmed, wait for the
 	// OpenStatusUpdate_ChanOpen update
@@ -1872,7 +1888,7 @@ func TestFundingManagerRestartBehavior(t *testing.T) {
 	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil, nil, nil)
 
 	// Check that the state machine is updated accordingly
-	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
+	assertAddedToGraph(t, alice, bob, fundingOutPoint)
 
 	// Next, we check that Alice sends the announcement signatures
 	// on restart after six confirmations. Bob should as expected send
@@ -2037,7 +2053,7 @@ func TestFundingManagerOfflinePeer(t *testing.T) {
 	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil, nil, nil)
 
 	// Check that the state machine is updated accordingly
-	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
+	assertAddedToGraph(t, alice, bob, fundingOutPoint)
 
 	// The funding transaction is now confirmed, wait for the
 	// OpenStatusUpdate_ChanOpen update
@@ -2496,7 +2512,7 @@ func TestFundingManagerReceiveChannelReadyTwice(t *testing.T) {
 	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil, nil, nil)
 
 	// Check that the state machine is updated accordingly
-	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
+	assertAddedToGraph(t, alice, bob, fundingOutPoint)
 
 	// The funding transaction is now confirmed, wait for the
 	// OpenStatusUpdate_ChanOpen update
@@ -2589,7 +2605,7 @@ func TestFundingManagerRestartAfterChanAnn(t *testing.T) {
 	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil, nil, nil)
 
 	// Check that the state machine is updated accordingly
-	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
+	assertAddedToGraph(t, alice, bob, fundingOutPoint)
 
 	// The funding transaction is now confirmed, wait for the
 	// OpenStatusUpdate_ChanOpen update
@@ -2693,7 +2709,7 @@ func TestFundingManagerRestartAfterReceivingChannelReady(t *testing.T) {
 	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil, nil, nil)
 
 	// Check that the state machine is updated accordingly
-	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
+	assertAddedToGraph(t, alice, bob, fundingOutPoint)
 
 	// Notify that six confirmations has been reached on funding
 	// transaction.
@@ -2907,9 +2923,9 @@ func TestFundingManagerPrivateRestart(t *testing.T) {
 	// announcements.
 	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil, nil, nil)
 
-	// Note: We don't check for the addedToRouterGraph state because in
+	// Note: We don't check for the addedToGraph state because in
 	// the private channel mode, the state is quickly changed from
-	// addedToRouterGraph to deleted from the database since the public
+	// addedToGraph to deleted from the database since the public
 	// announcement phase is skipped.
 
 	// The funding transaction is now confirmed, wait for the
@@ -4558,8 +4574,8 @@ func testZeroConf(t *testing.T, chanType *lnwire.ChannelType) {
 	// We'll now wait for the OpenStatusUpdate_ChanOpen update.
 	waitForOpenUpdate(t, updateChan)
 
-	// Assert that both Alice & Bob are in the addedToRouterGraph state.
-	assertAddedToRouterGraph(t, alice, bob, fundingOp)
+	// Assert that both Alice & Bob are in the addedToGraph state.
+	assertAddedToGraph(t, alice, bob, fundingOp)
 
 	// We'll now restart Alice's funding manager and assert that the tx
 	// is rebroadcast.

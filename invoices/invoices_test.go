@@ -69,7 +69,7 @@ func randInvoice(value lnwire.MilliSatoshi) (*invpkg.Invoice, error) {
 	i := &invpkg.Invoice{
 		CreationDate: testNow,
 		Terms: invpkg.ContractTerm{
-			Expiry:          4000,
+			Expiry:          time.Duration(4000) * time.Second,
 			PaymentPreimage: &pre,
 			PaymentAddr:     payAddr,
 			Value:           value,
@@ -176,7 +176,7 @@ func TestInvoices(t *testing.T) {
 			test: testQueryInvoices,
 		},
 		{
-			name: "CustomRecords",
+			name: "OutWireCustomRecords",
 			test: testCustomRecords,
 		},
 		{
@@ -247,7 +247,14 @@ func TestInvoices(t *testing.T) {
 
 		testClock := clock.NewTestClock(testNow)
 
-		return invpkg.NewSQLStore(executor, testClock)
+		// We'll use a pagination limit of 3 for all tests to ensure
+		// that we also cover query pagination.
+		const testPaginationLimit = 3
+
+		return invpkg.NewSQLStore(
+			executor, testClock,
+			invpkg.WithPaginationLimit(testPaginationLimit),
+		)
 	}
 
 	for _, test := range testList {
@@ -2681,8 +2688,11 @@ func testDeleteCanceledInvoices(t *testing.T,
 		}, nil
 	}
 
-	// Add some invoices to the test db.
+	// Test deletion of canceled invoices when there are none.
 	ctxb := context.Background()
+	require.NoError(t, db.DeleteCanceledInvoices(ctxb))
+
+	// Add some invoices to the test db.
 	var invoices []invpkg.Invoice
 	for i := 0; i < 10; i++ {
 		invoice, err := randInvoice(lnwire.MilliSatoshi(i + 1))

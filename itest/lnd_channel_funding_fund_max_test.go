@@ -2,7 +2,7 @@ package itest
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil"
@@ -15,7 +15,6 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/stretchr/testify/require"
 )
 
 type chanFundMaxTestCase struct {
@@ -220,7 +219,7 @@ func runFundMaxTestCase(ht *lntest.HarnessTest, alice, bob *node.HarnessNode,
 	// If we don't expect the channel opening to be
 	// successful, simply check for an error.
 	if testCase.chanOpenShouldFail {
-		expectedErr := fmt.Errorf(testCase.expectedErrStr)
+		expectedErr := errors.New(testCase.expectedErrStr)
 		ht.OpenChannelAssertErr(
 			alice, bob, chanParams, expectedErr,
 		)
@@ -309,7 +308,7 @@ func fundingFee(numInput int, change bool) btcutil.Amount {
 		weightEstimate.AddP2TROutput()
 	}
 
-	totalWeight := int64(weightEstimate.Weight())
+	totalWeight := weightEstimate.Weight()
 
 	return feeRate.FeeForWeight(totalWeight)
 }
@@ -317,13 +316,13 @@ func fundingFee(numInput int, change bool) btcutil.Amount {
 // sweepNodeWalletAndAssert sweeps funds from a node wallet.
 func sweepNodeWalletAndAssert(ht *lntest.HarnessTest, node *node.HarnessNode) {
 	// New miner address we will sweep all funds to.
-	minerAddr, err := ht.Miner.NewAddress()
-	require.NoError(ht, err)
+	minerAddr := ht.NewMinerAddress()
 
 	// Send all funds back to the miner node.
 	node.RPC.SendCoins(&lnrpc.SendCoinsRequest{
-		Addr:    minerAddr.String(),
-		SendAll: true,
+		Addr:       minerAddr.String(),
+		SendAll:    true,
+		TargetConf: 6,
 	})
 
 	// Ensures we don't leave any transaction in the mempool after sweeping.

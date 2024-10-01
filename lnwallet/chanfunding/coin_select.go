@@ -116,7 +116,7 @@ func calculateFees(utxos []wallet.Coin, feeRate chainfee.SatPerKWeight,
 
 	// Estimate the fee required for a transaction without a change
 	// output.
-	totalWeight := int64(weightEstimate.Weight())
+	totalWeight := weightEstimate.Weight()
 	requiredFeeNoChange := feeRate.FeeForWeight(totalWeight)
 
 	// Estimate the fee required for a transaction with a change output.
@@ -137,7 +137,7 @@ func calculateFees(utxos []wallet.Coin, feeRate chainfee.SatPerKWeight,
 
 	// Now that we have added the change output, redo the fee
 	// estimate.
-	totalWeight = int64(weightEstimate.Weight())
+	totalWeight = weightEstimate.Weight()
 	requiredFeeWithChange := feeRate.FeeForWeight(totalWeight)
 
 	return requiredFeeNoChange, requiredFeeWithChange, nil
@@ -373,7 +373,8 @@ func CoinSelectUpToAmount(feeRate chainfee.SatPerKWeight, minAmount, maxAmount,
 	)
 
 	var errInsufficientFunds *ErrInsufficientFunds
-	if err == nil { //nolint:gocritic,ifElseChain
+	switch {
+	case err == nil:
 		// If the coin selection succeeds we check if our total balance
 		// covers the selected set of coins including fees plus an
 		// optional anchor reserve.
@@ -396,11 +397,13 @@ func CoinSelectUpToAmount(feeRate chainfee.SatPerKWeight, minAmount, maxAmount,
 			// our total balance minus reserve and fees.
 			selectSubtractFee = true
 		}
-	} else if errors.As(err, &errInsufficientFunds) {
+
+	case errors.As(err, &errInsufficientFunds):
 		// If the initial coin selection fails due to insufficient funds
 		// we select our total available balance minus fees.
 		selectSubtractFee = true
-	} else {
+
+	default:
 		return nil, 0, 0, err
 	}
 

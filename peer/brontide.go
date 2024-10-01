@@ -7,16 +7,19 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/connmgr"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/buffer"
 	"github.com/lightningnetwork/lnd/build"
@@ -35,11 +38,13 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chancloser"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/msgmux"
 	"github.com/lightningnetwork/lnd/netann"
 	"github.com/lightningnetwork/lnd/pool"
 	"github.com/lightningnetwork/lnd/queue"
@@ -76,6 +81,16 @@ const (
 
 	// ErrorBufferSize is the number of historic peer errors that we store.
 	ErrorBufferSize = 10
+
+	// pongSizeCeiling is the upper bound on a uniformly distributed random
+	// variable that we use for requesting pong responses. We don't use the
+	// MaxPongBytes (upper bound accepted by the protocol) because it is
+	// needlessly wasteful of precious Tor bandwidth for little to no gain.
+	pongSizeCeiling = 4096
+
+	// torTimeoutMultiplier is the scaling factor we use on network timeouts
+	// for Tor peers.
+	torTimeoutMultiplier = 3
 )
 
 var (
@@ -130,6 +145,21 @@ type PendingUpdate struct {
 type ChannelCloseUpdate struct {
 	ClosingTxid []byte
 	Success     bool
+
+	// LocalCloseOutput is an optional, additional output on the closing
+	// transaction that the local party should be paid to. This will only be
+	// populated if the local balance isn't dust.
+	LocalCloseOutput fn.Option[chancloser.CloseOutput]
+
+	// RemoteCloseOutput is an optional, additional output on the closing
+	// transaction that the remote party should be paid to. This will only
+	// be populated if the remote balance isn't dust.
+	RemoteCloseOutput fn.Option[chancloser.CloseOutput]
+
+	// AuxOutputs is an optional set of additional outputs that might be
+	// included in the closing transaction. These are used for custom
+	// channel types.
+	AuxOutputs fn.Option[chancloser.AuxCloseOutputs]
 }
 
 // TimestampedError is a timestamped error that is used to store the most recent
@@ -288,7 +318,7 @@ type Config struct {
 
 	// FetchLastChanUpdate fetches our latest channel update for a target
 	// channel.
-	FetchLastChanUpdate func(lnwire.ShortChannelID) (*lnwire.ChannelUpdate,
+	FetchLastChanUpdate func(lnwire.ShortChannelID) (*lnwire.ChannelUpdate1,
 		error)
 
 	// FundingManager is an implementation of the funding.Controller interface.
@@ -357,7 +387,15 @@ type Config struct {
 
 	// AddLocalAlias persists an alias to an underlying alias store.
 	AddLocalAlias func(alias, base lnwire.ShortChannelID,
-		gossip bool) error
+		gossip, liveUpdate bool) error
+
+	// AuxLeafStore is an optional store that can be used to store auxiliary
+	// leaves for certain custom channel types.
+	AuxLeafStore fn.Option[lnwallet.AuxLeafStore]
+
+	// AuxSigner is an optional signer that can be used to sign auxiliary
+	// leaves for certain custom channel types.
+	AuxSigner fn.Option[lnwallet.AuxSigner]
 
 	// PongBuf is a slice we'll reuse instead of allocating memory on the
 	// heap. Since only reads will occur and no writes, there is no need
@@ -369,6 +407,19 @@ type Config struct {
 	// by failing back any blinding-related payloads as if they were
 	// invalid.
 	DisallowRouteBlinding bool
+
+	// MaxFeeExposure limits the number of outstanding fees in a channel.
+	// This value will be passed to created links.
+	MaxFeeExposure lnwire.MilliSatoshi
+
+	// MsgRouter is an optional instance of the main message router that
+	// the peer will use. If None, then a new default version will be used
+	// in place.
+	MsgRouter fn.Option[msgmux.Router]
+
+	// AuxChanCloser is an optional instance of an abstraction that can be
+	// used to modify the way the co-op close transaction is constructed.
+	AuxChanCloser fn.Option[chancloser.AuxChanCloser]
 
 	// Quit is the server's quit channel. If this is closed, we halt operation.
 	Quit chan struct{}
@@ -388,6 +439,23 @@ type Brontide struct {
 	// MUST be used atomically.
 	bytesReceived uint64
 	bytesSent     uint64
+
+	// isTorConnection is a flag that indicates whether or not we believe
+	// the remote peer is a tor connection. It is not always possible to
+	// know this with certainty but we have heuristics we use that should
+	// catch most cases.
+	//
+	// NOTE: We judge the tor-ness of a connection by if the remote peer has
+	// ".onion" in the address OR if it's connected over localhost.
+	// This will miss cases where our peer is connected to our clearnet
+	// address over the tor network (via exit nodes). It will also misjudge
+	// actual localhost connections as tor. We need to include this because
+	// inbound connections to our tor address will appear to come from the
+	// local socks5 proxy. This heuristic is only used to expand the timeout
+	// window for peers so it is OK to misjudge this. If you use this field
+	// for any other purpose you should seriously consider whether or not
+	// this heuristic is good enough for your use case.
+	isTorConnection bool
 
 	pingManager *PingManager
 
@@ -489,6 +557,15 @@ type Brontide struct {
 	// potentially holding lots of un-consumed events.
 	channelEventClient *subscribe.Client
 
+	// msgRouter is an instance of the msgmux.Router which is used to send
+	// off new wire messages for handing.
+	msgRouter fn.Option[msgmux.Router]
+
+	// globalMsgRouter is a flag that indicates whether we have a global
+	// msg router. If so, then we don't worry about stopping the msg router
+	// when a peer disconnects.
+	globalMsgRouter bool
+
 	startReady chan struct{}
 	quit       chan struct{}
 	wg         sync.WaitGroup
@@ -503,6 +580,17 @@ var _ lnpeer.Peer = (*Brontide)(nil)
 // NewBrontide creates a new Brontide from a peer.Config struct.
 func NewBrontide(cfg Config) *Brontide {
 	logPrefix := fmt.Sprintf("Peer(%x):", cfg.PubKeyBytes)
+
+	// We have a global message router if one was passed in via the config.
+	// In this case, we don't need to attempt to tear it down when the peer
+	// is stopped.
+	globalMsgRouter := cfg.MsgRouter.IsSome()
+
+	// We'll either use the msg router instance passed in, or create a new
+	// blank instance.
+	msgRouter := cfg.MsgRouter.Alt(fn.Some[msgmux.Router](
+		msgmux.NewMultiMsgRouter(),
+	))
 
 	p := &Brontide{
 		cfg:           cfg,
@@ -526,6 +614,14 @@ func NewBrontide(cfg Config) *Brontide {
 		startReady:         make(chan struct{}),
 		quit:               make(chan struct{}),
 		log:                build.NewPrefixLog(logPrefix, peerLog),
+		msgRouter:          msgRouter,
+		globalMsgRouter:    globalMsgRouter,
+	}
+
+	if cfg.Conn != nil && cfg.Conn.RemoteAddr() != nil {
+		remoteAddr := cfg.Conn.RemoteAddr().String()
+		p.isTorConnection = strings.Contains(remoteAddr, ".onion") ||
+			strings.Contains(remoteAddr, "127.0.0.1")
 	}
 
 	var (
@@ -558,25 +654,24 @@ func NewBrontide(cfg Config) *Brontide {
 		return lastSerializedBlockHeader[:]
 	}
 
-	// TODO(roasbeef): make dynamic in order to
-	// create fake cover traffic
-	// NOTE(proofofkeags): this was changed to be
-	// dynamic to allow better pong identification,
-	// however, more thought is needed to make this
-	// actually usable as a traffic decoy
+	// TODO(roasbeef): make dynamic in order to create fake cover traffic.
+	//
+	// NOTE(proofofkeags): this was changed to be dynamic to allow better
+	// pong identification, however, more thought is needed to make this
+	// actually usable as a traffic decoy.
 	randPongSize := func() uint16 {
 		return uint16(
 			// We don't need cryptographic randomness here.
 			/* #nosec */
-			rand.Intn(lnwire.MaxPongBytes + 1),
+			rand.Intn(pongSizeCeiling) + 1,
 		)
 	}
 
 	p.pingManager = NewPingManager(&PingManagerConfig{
 		NewPingPayload:   newPingPayload,
 		NewPongSize:      randPongSize,
-		IntervalDuration: pingInterval,
-		TimeoutDuration:  pingTimeout,
+		IntervalDuration: p.scaleTimeout(pingInterval),
+		TimeoutDuration:  p.scaleTimeout(pingTimeout),
 		SendPing: func(ping *lnwire.Ping) {
 			p.queueMsg(ping, nil)
 		},
@@ -700,6 +795,12 @@ func (p *Brontide) Start() error {
 		return err
 	}
 
+	// Register the message router now as we may need to register some
+	// endpoints while loading the channels below.
+	p.msgRouter.WhenSome(func(router msgmux.Router) {
+		router.Start()
+	})
+
 	msgs, err := p.loadActiveChannels(activeChans)
 	if err != nil {
 		return fmt.Errorf("unable to load channels: %w", err)
@@ -749,7 +850,9 @@ func (p *Brontide) Start() error {
 	//
 	// TODO(wilmer): Remove this once we're able to query for node
 	// announcements through their timestamps.
+	p.wg.Add(2)
 	go p.maybeSendNodeAnn(activeChans)
+	go p.maybeSendChannelUpdates()
 
 	return nil
 }
@@ -799,6 +902,73 @@ func (p *Brontide) QuitSignal() <-chan struct{} {
 	return p.quit
 }
 
+// internalKeyForAddr returns the internal key associated with a taproot
+// address.
+func internalKeyForAddr(wallet *lnwallet.LightningWallet,
+	deliveryScript []byte) (fn.Option[btcec.PublicKey], error) {
+
+	none := fn.None[btcec.PublicKey]()
+
+	pkScript, err := txscript.ParsePkScript(deliveryScript)
+	if err != nil {
+		return none, err
+	}
+	addr, err := pkScript.Address(&wallet.Cfg.NetParams)
+	if err != nil {
+		return none, err
+	}
+
+	// If it's not a taproot address, we don't require to know the internal
+	// key in the first place. So we don't return an error here, but also no
+	// internal key.
+	_, isTaproot := addr.(*btcutil.AddressTaproot)
+	if !isTaproot {
+		return none, nil
+	}
+
+	walletAddr, err := wallet.AddressInfo(addr)
+	if err != nil {
+		return none, err
+	}
+
+	// If the address isn't known to the wallet, we can't determine the
+	// internal key.
+	if walletAddr == nil {
+		return none, nil
+	}
+
+	pubKeyAddr, ok := walletAddr.(waddrmgr.ManagedPubKeyAddress)
+	if !ok {
+		return none, fmt.Errorf("expected pubkey addr, got %T",
+			pubKeyAddr)
+	}
+
+	return fn.Some(*pubKeyAddr.PubKey()), nil
+}
+
+// addrWithInternalKey takes a delivery script, then attempts to supplement it
+// with information related to the internal key for the addr, but only if it's
+// a taproot addr.
+func (p *Brontide) addrWithInternalKey(
+	deliveryScript []byte) fn.Result[chancloser.DeliveryAddrWithKey] {
+
+	// TODO(roasbeef): not compatible with external shutdown addr?
+	// Currently, custom channels cannot be created with external upfront
+	// shutdown addresses, so this shouldn't be an issue. We only require
+	// the internal key for taproot addresses to be able to provide a non
+	// inclusion proof of any scripts.
+
+	internalKey, err := internalKeyForAddr(p.cfg.Wallet, deliveryScript)
+	if err != nil {
+		return fn.Err[chancloser.DeliveryAddrWithKey](err)
+	}
+
+	return fn.Ok(chancloser.DeliveryAddrWithKey{
+		DeliveryAddress: deliveryScript,
+		InternalKey:     internalKey,
+	})
+}
+
 // loadActiveChannels creates indexes within the peer for tracking all active
 // channels returned by the database. It returns a slice of channel reestablish
 // messages that should be sent to the peer immediately, in case we have borked
@@ -834,6 +1004,7 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 
 				err = p.cfg.AddLocalAlias(
 					aliasScid, dbChan.ShortChanID(), false,
+					false,
 				)
 				if err != nil {
 					return nil, err
@@ -869,11 +1040,19 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 			}
 		}
 
+		var chanOpts []lnwallet.ChannelOpt
+		p.cfg.AuxLeafStore.WhenSome(func(s lnwallet.AuxLeafStore) {
+			chanOpts = append(chanOpts, lnwallet.WithLeafStore(s))
+		})
+		p.cfg.AuxSigner.WhenSome(func(s lnwallet.AuxSigner) {
+			chanOpts = append(chanOpts, lnwallet.WithAuxSigner(s))
+		})
 		lnChan, err := lnwallet.NewLightningChannel(
-			p.cfg.Signer, dbChan, p.cfg.SigPool,
+			p.cfg.Signer, dbChan, p.cfg.SigPool, chanOpts...,
 		)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("unable to create channel "+
+				"state machine: %w", err)
 		}
 
 		chanPoint := dbChan.FundingOutpoint
@@ -941,7 +1120,7 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 		info, p1, p2, err := graph.FetchChannelEdgesByOutpoint(
 			&chanPoint,
 		)
-		if err != nil && err != channeldb.ErrEdgeNotFound {
+		if err != nil && !errors.Is(err, channeldb.ErrEdgeNotFound) {
 			return nil, err
 		}
 
@@ -1030,9 +1209,16 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 				return
 			}
 
+			addr, err := p.addrWithInternalKey(
+				info.DeliveryScript.Val,
+			).Unpack()
+			if err != nil {
+				shutdownInfoErr = fmt.Errorf("unable to make "+
+					"delivery addr: %w", err)
+				return
+			}
 			chanCloser, err := p.createChanCloser(
-				lnChan, info.DeliveryScript.Val, feePerKw, nil,
-				info.LocalInitiator.Val,
+				lnChan, addr, feePerKw, nil, info.Closer(),
 			)
 			if err != nil {
 				shutdownInfoErr = fmt.Errorf("unable to "+
@@ -1056,7 +1242,7 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 				return
 			}
 
-			shutdownMsg = fn.Some[lnwire.Shutdown](*shutdown)
+			shutdownMsg = fn.Some(*shutdown)
 		})
 		if shutdownInfoErr != nil {
 			return nil, shutdownInfoErr
@@ -1146,8 +1332,8 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 		),
 		BatchSize:               p.cfg.ChannelCommitBatchSize,
 		UnsafeReplay:            p.cfg.UnsafeReplay,
-		MinFeeUpdateTimeout:     htlcswitch.DefaultMinLinkFeeUpdateTimeout,
-		MaxFeeUpdateTimeout:     htlcswitch.DefaultMaxLinkFeeUpdateTimeout,
+		MinUpdateTimeout:        htlcswitch.DefaultMinLinkFeeUpdateTimeout,
+		MaxUpdateTimeout:        htlcswitch.DefaultMaxLinkFeeUpdateTimeout,
 		OutgoingCltvRejectDelta: p.cfg.OutgoingCltvRejectDelta,
 		TowerClient:             p.cfg.TowerClient,
 		MaxOutgoingCltvExpiry:   p.cfg.MaxOutgoingCltvExpiry,
@@ -1161,6 +1347,7 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 		GetAliases:              p.cfg.GetAliases,
 		PreviouslySentShutdown:  shutdownMsg,
 		DisallowRouteBlinding:   p.cfg.DisallowRouteBlinding,
+		MaxFeeExposure:          p.cfg.MaxFeeExposure,
 	}
 
 	// Before adding our new link, purge the switch of any pending or live
@@ -1179,6 +1366,8 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 // maybeSendNodeAnn sends our node announcement to the remote peer if at least
 // one confirmed public channel exists with them.
 func (p *Brontide) maybeSendNodeAnn(channels []*channeldb.OpenChannel) {
+	defer p.wg.Done()
+
 	hasConfirmedPublicChan := false
 	for _, channel := range channels {
 		if channel.IsPending {
@@ -1204,6 +1393,72 @@ func (p *Brontide) maybeSendNodeAnn(channels []*channeldb.OpenChannel) {
 	if err := p.SendMessageLazy(false, &ourNodeAnn); err != nil {
 		p.log.Debugf("Unable to resend node announcement: %v", err)
 	}
+}
+
+// maybeSendChannelUpdates sends our channel updates to the remote peer if we
+// have any active channels with them.
+func (p *Brontide) maybeSendChannelUpdates() {
+	defer p.wg.Done()
+
+	// If we don't have any active channels, then we can exit early.
+	if p.activeChannels.Len() == 0 {
+		return
+	}
+
+	maybeSendUpd := func(cid lnwire.ChannelID,
+		lnChan *lnwallet.LightningChannel) error {
+
+		// Nil channels are pending, so we'll skip them.
+		if lnChan == nil {
+			return nil
+		}
+
+		dbChan := lnChan.State()
+		scid := func() lnwire.ShortChannelID {
+			switch {
+			// Otherwise if it's a zero conf channel and confirmed,
+			// then we need to use the "real" scid.
+			case dbChan.IsZeroConf() && dbChan.ZeroConfConfirmed():
+				return dbChan.ZeroConfRealScid()
+
+			// Otherwise, we can use the normal scid.
+			default:
+				return dbChan.ShortChanID()
+			}
+		}()
+
+		// Now that we know the channel is in a good state, we'll try
+		// to fetch the update to send to the remote peer. If the
+		// channel is pending, and not a zero conf channel, we'll get
+		// an error here which we'll ignore.
+		chanUpd, err := p.cfg.FetchLastChanUpdate(scid)
+		if err != nil {
+			p.log.Debugf("Unable to fetch channel update for "+
+				"ChannelPoint(%v), scid=%v: %v",
+				dbChan.FundingOutpoint, dbChan.ShortChanID, err)
+
+			return nil
+		}
+
+		p.log.Debugf("Sending channel update for ChannelPoint(%v), "+
+			"scid=%v", dbChan.FundingOutpoint, dbChan.ShortChanID)
+
+		// We'll send it as a normal message instead of using the lazy
+		// queue to prioritize transmission of the fresh update.
+		if err := p.SendMessage(false, chanUpd); err != nil {
+			err := fmt.Errorf("unable to send channel update for "+
+				"ChannelPoint(%v), scid=%v: %w",
+				dbChan.FundingOutpoint, dbChan.ShortChanID(),
+				err)
+			p.log.Errorf(err.Error())
+
+			return err
+		}
+
+		return nil
+	}
+
+	p.activeChannels.ForEach(maybeSendUpd)
 }
 
 // WaitForDisconnect waits until the peer has disconnected. A peer may be
@@ -1252,14 +1507,20 @@ func (p *Brontide) Disconnect(reason error) {
 
 	p.log.Infof(err.Error())
 
+	// Stop PingManager before closing TCP connection.
+	p.pingManager.Stop()
+
 	// Ensure that the TCP connection is properly closed before continuing.
 	p.cfg.Conn.Close()
 
 	close(p.quit)
 
-	if err := p.pingManager.Stop(); err != nil {
-		p.log.Errorf("couldn't stop pingManager during disconnect: %v",
-			err)
+	// If our msg router isn't global (local to this instance), then we'll
+	// stop it. Otherwise, we'll leave it running.
+	if !p.globalMsgRouter {
+		p.msgRouter.WhenSome(func(router msgmux.Router) {
+			router.Stop()
+		})
 	}
 }
 
@@ -1296,7 +1557,9 @@ func (p *Brontide) readNextMessage() (lnwire.Message, error) {
 		// pool. We do so only after the task has been scheduled to
 		// ensure the deadline doesn't expire while the message is in
 		// the process of being scheduled.
-		readDeadline := time.Now().Add(readMessageTimeout)
+		readDeadline := time.Now().Add(
+			p.scaleTimeout(readMessageTimeout),
+		)
 		readErr := noiseConn.SetReadDeadline(readDeadline)
 		if readErr != nil {
 			return readErr
@@ -1700,6 +1963,22 @@ out:
 			}
 		}
 
+		// If a message router is active, then we'll try to have it
+		// handle this message. If it can, then we're able to skip the
+		// rest of the message handling logic.
+		err = fn.MapOptionZ(p.msgRouter, func(r msgmux.Router) error {
+			return r.RouteMsg(msgmux.PeerMsg{
+				PeerPub: *p.IdentityKey(),
+				Message: nextMsg,
+			})
+		})
+
+		// No error occurred, and the message was handled by the
+		// router.
+		if err == nil {
+			continue
+		}
+
 		var (
 			targetChan   lnwire.ChannelID
 			isLinkUpdate bool
@@ -1786,10 +2065,10 @@ out:
 					nextMsg.MsgType())
 			}
 
-		case *lnwire.ChannelUpdate,
-			*lnwire.ChannelAnnouncement,
+		case *lnwire.ChannelUpdate1,
+			*lnwire.ChannelAnnouncement1,
 			*lnwire.NodeAnnouncement,
-			*lnwire.AnnounceSignatures,
+			*lnwire.AnnounceSignatures1,
 			*lnwire.GossipTimestampRange,
 			*lnwire.QueryShortChanIDs,
 			*lnwire.QueryChannelRange,
@@ -2016,17 +2295,18 @@ func messageSummary(msg lnwire.Message) string {
 		)
 
 		return fmt.Sprintf("chan_id=%v, id=%v, amt=%v, expiry=%v, "+
-			"hash=%x, blinding_point=%x", msg.ChanID, msg.ID,
-			msg.Amount, msg.Expiry, msg.PaymentHash[:],
-			blindingPoint)
+			"hash=%x, blinding_point=%x, custom_records=%v",
+			msg.ChanID, msg.ID, msg.Amount, msg.Expiry,
+			msg.PaymentHash[:], blindingPoint, msg.CustomRecords)
 
 	case *lnwire.UpdateFailHTLC:
 		return fmt.Sprintf("chan_id=%v, id=%v, reason=%x", msg.ChanID,
 			msg.ID, msg.Reason)
 
 	case *lnwire.UpdateFulfillHTLC:
-		return fmt.Sprintf("chan_id=%v, id=%v, pre_image=%x",
-			msg.ChanID, msg.ID, msg.PaymentPreimage[:])
+		return fmt.Sprintf("chan_id=%v, id=%v, pre_image=%x, "+
+			"custom_records=%v", msg.ChanID, msg.ID,
+			msg.PaymentPreimage[:], msg.CustomRecords)
 
 	case *lnwire.CommitSig:
 		return fmt.Sprintf("chan_id=%v, num_htlcs=%v", msg.ChanID,
@@ -2047,15 +2327,15 @@ func messageSummary(msg lnwire.Message) string {
 	case *lnwire.Error:
 		return fmt.Sprintf("%v", msg.Error())
 
-	case *lnwire.AnnounceSignatures:
+	case *lnwire.AnnounceSignatures1:
 		return fmt.Sprintf("chan_id=%v, short_chan_id=%v", msg.ChannelID,
 			msg.ShortChannelID.ToUint64())
 
-	case *lnwire.ChannelAnnouncement:
+	case *lnwire.ChannelAnnouncement1:
 		return fmt.Sprintf("chain_hash=%v, short_chan_id=%v",
 			msg.ChainHash, msg.ShortChannelID.ToUint64())
 
-	case *lnwire.ChannelUpdate:
+	case *lnwire.ChannelUpdate1:
 		return fmt.Sprintf("chain_hash=%v, short_chan_id=%v, "+
 			"mflags=%v, cflags=%v, update_time=%v", msg.ChainHash,
 			msg.ShortChannelID.ToUint64(), msg.MessageFlags,
@@ -2105,6 +2385,10 @@ func messageSummary(msg lnwire.Message) string {
 			time.Unix(int64(msg.FirstTimestamp), 0),
 			msg.TimestampRange)
 
+	case *lnwire.Stfu:
+		return fmt.Sprintf("chan_id=%v, initiator=%v", msg.ChanID,
+			msg.Initiator)
+
 	case *lnwire.Custom:
 		return fmt.Sprintf("type=%d", msg.Type)
 	}
@@ -2123,7 +2407,7 @@ func (p *Brontide) logWireMessage(msg lnwire.Message, read bool) {
 		summaryPrefix = "Sending"
 	}
 
-	p.log.Debugf("%v", newLogClosure(func() string {
+	p.log.Debugf("%v", lnutils.NewLogClosure(func() string {
 		// Debug summary of message.
 		summary := messageSummary(msg)
 		if len(summary) > 0 {
@@ -2151,9 +2435,7 @@ func (p *Brontide) logWireMessage(msg lnwire.Message, read bool) {
 		prefix = "writeMessage to peer"
 	}
 
-	p.log.Tracef(prefix+": %v", newLogClosure(func() string {
-		return spew.Sdump(msg)
-	}))
+	p.log.Tracef(prefix+": %v", lnutils.SpewLogClosure(msg))
 }
 
 // writeMessage writes and flushes the target lnwire.Message to the remote peer.
@@ -2178,7 +2460,9 @@ func (p *Brontide) writeMessage(msg lnwire.Message) error {
 	flushMsg := func() error {
 		// Ensure the write deadline is set before we attempt to send
 		// the message.
-		writeDeadline := time.Now().Add(writeMessageTimeout)
+		writeDeadline := time.Now().Add(
+			p.scaleTimeout(writeMessageTimeout),
+		)
 		err := noiseConn.SetWriteDeadline(writeDeadline)
 		if err != nil {
 			return err
@@ -2693,8 +2977,12 @@ func (p *Brontide) fetchActiveChanCloser(chanID lnwire.ChannelID) (
 		return nil, fmt.Errorf("unable to estimate fee")
 	}
 
+	addr, err := p.addrWithInternalKey(deliveryScript).Unpack()
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse addr: %w", err)
+	}
 	chanCloser, err = p.createChanCloser(
-		channel, deliveryScript, feePerKw, nil, false,
+		channel, addr, feePerKw, nil, lntypes.Remote,
 	)
 	if err != nil {
 		p.log.Errorf("unable to create chan closer: %v", err)
@@ -2903,7 +3191,7 @@ func (p *Brontide) restartCoopClose(lnChan *lnwallet.LightningChannel) (
 		})
 
 	// An error other than ErrNoShutdownInfo was returned
-	case err != nil && !errors.Is(err, channeldb.ErrNoShutdownInfo):
+	case !errors.Is(err, channeldb.ErrNoShutdownInfo):
 		return nil, err
 
 	case errors.Is(err, channeldb.ErrNoShutdownInfo):
@@ -2931,12 +3219,17 @@ func (p *Brontide) restartCoopClose(lnChan *lnwallet.LightningChannel) (
 
 	// Determine whether we or the peer are the initiator of the coop
 	// close attempt by looking at the channel's status.
-	locallyInitiated := c.HasChanStatus(
-		channeldb.ChanStatusLocalCloseInitiator,
-	)
+	closingParty := lntypes.Remote
+	if c.HasChanStatus(channeldb.ChanStatusLocalCloseInitiator) {
+		closingParty = lntypes.Local
+	}
 
+	addr, err := p.addrWithInternalKey(deliveryScript).Unpack()
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse addr: %w", err)
+	}
 	chanCloser, err := p.createChanCloser(
-		lnChan, deliveryScript, feePerKw, nil, locallyInitiated,
+		lnChan, addr, feePerKw, nil, closingParty,
 	)
 	if err != nil {
 		p.log.Errorf("unable to create chan closer: %v", err)
@@ -2963,9 +3256,9 @@ func (p *Brontide) restartCoopClose(lnChan *lnwallet.LightningChannel) (
 // createChanCloser constructs a ChanCloser from the passed parameters and is
 // used to de-duplicate code.
 func (p *Brontide) createChanCloser(channel *lnwallet.LightningChannel,
-	deliveryScript lnwire.DeliveryAddress, fee chainfee.SatPerKWeight,
-	req *htlcswitch.ChanClose,
-	locallyInitiated bool) (*chancloser.ChanCloser, error) {
+	deliveryScript chancloser.DeliveryAddrWithKey,
+	fee chainfee.SatPerKWeight, req *htlcswitch.ChanClose,
+	closer lntypes.ChannelParty) (*chancloser.ChanCloser, error) {
 
 	_, startingHeight, err := p.cfg.ChainIO.GetBestBlock()
 	if err != nil {
@@ -2985,6 +3278,7 @@ func (p *Brontide) createChanCloser(channel *lnwallet.LightningChannel,
 			MusigSession: NewMusigChanCloser(channel),
 			FeeEstimator: &chancloser.SimpleCoopFeeEstimator{},
 			BroadcastTx:  p.cfg.Wallet.PublishTransaction,
+			AuxCloser:    p.cfg.AuxChanCloser,
 			DisableChannel: func(op wire.OutPoint) error {
 				return p.cfg.ChanStatusMgr.RequestDisable(
 					op, false,
@@ -3001,7 +3295,7 @@ func (p *Brontide) createChanCloser(channel *lnwallet.LightningChannel,
 		fee,
 		uint32(startingHeight),
 		req,
-		locallyInitiated,
+		closer,
 	)
 
 	return chanCloser, nil
@@ -3056,9 +3350,17 @@ func (p *Brontide) handleLocalCloseReq(req *htlcswitch.ChanClose) {
 				return
 			}
 		}
+		addr, err := p.addrWithInternalKey(deliveryScript).Unpack()
+		if err != nil {
+			err = fmt.Errorf("unable to parse addr for channel "+
+				"%v: %w", req.ChanPoint, err)
+			p.log.Errorf(err.Error())
+			req.Err <- err
 
+			return
+		}
 		chanCloser, err := p.createChanCloser(
-			channel, deliveryScript, req.TargetFeePerKw, req, true,
+			channel, addr, req.TargetFeePerKw, req, lntypes.Local,
 		)
 		if err != nil {
 			p.log.Errorf(err.Error())
@@ -3280,17 +3582,25 @@ func (p *Brontide) finalizeChanClosure(chanCloser *chancloser.ChanCloser) {
 		}
 	}
 
-	go WaitForChanToClose(chanCloser.NegotiationHeight(), notifier, errChan,
+	localOut := chanCloser.LocalCloseOutput()
+	remoteOut := chanCloser.RemoteCloseOutput()
+	auxOut := chanCloser.AuxOutputs()
+	go WaitForChanToClose(
+		chanCloser.NegotiationHeight(), notifier, errChan,
 		&chanPoint, &closingTxid, closingTx.TxOut[0].PkScript, func() {
 			// Respond to the local subsystem which requested the
 			// channel closure.
 			if closeReq != nil {
 				closeReq.Updates <- &ChannelCloseUpdate{
-					ClosingTxid: closingTxid[:],
-					Success:     true,
+					ClosingTxid:       closingTxid[:],
+					Success:           true,
+					LocalCloseOutput:  localOut,
+					RemoteCloseOutput: remoteOut,
+					AuxOutputs:        auxOut,
 				}
 			}
-		})
+		},
+	)
 }
 
 // WaitForChanToClose uses the passed notifier to wait until the channel has
@@ -3977,6 +4287,13 @@ func (p *Brontide) addActiveChannel(c *lnpeer.NewChannel) error {
 		chanOpts = append(chanOpts, lnwallet.WithSkipNonceInit())
 	}
 
+	p.cfg.AuxLeafStore.WhenSome(func(s lnwallet.AuxLeafStore) {
+		chanOpts = append(chanOpts, lnwallet.WithLeafStore(s))
+	})
+	p.cfg.AuxSigner.WhenSome(func(s lnwallet.AuxSigner) {
+		chanOpts = append(chanOpts, lnwallet.WithAuxSigner(s))
+	})
+
 	// If not already active, we'll add this channel to the set of active
 	// channels, so we can look it up later easily according to its channel
 	// ID.
@@ -4147,4 +4464,16 @@ func (p *Brontide) sendLinkUpdateMsg(cid lnwire.ChannelID, msg lnwire.Message) {
 	// With the stream obtained, add the message to the stream so we can
 	// continue processing message.
 	chanStream.AddMsg(msg)
+}
+
+// scaleTimeout multiplies the argument duration by a constant factor depending
+// on variious heuristics. Currently this is only used to check whether our peer
+// appears to be connected over Tor and relaxes the timout deadline. However,
+// this is subject to change and should be treated as opaque.
+func (p *Brontide) scaleTimeout(timeout time.Duration) time.Duration {
+	if p.isTorConnection {
+		return timeout * time.Duration(torTimeoutMultiplier)
+	}
+
+	return timeout
 }

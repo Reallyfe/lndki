@@ -3,7 +3,6 @@ package itest
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -95,7 +94,7 @@ func newChanRestoreScenario(ht *lntest.HarnessTest, ct lnrpc.CommitmentType,
 	ht.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, dave)
 
 	// Mine a block to confirm the funds.
-	ht.MineBlocks(1)
+	ht.MineBlocksAndAssertNumTxes(1, 2)
 
 	// For the anchor output case we need two UTXOs for Carol so she can
 	// sweep both the local and remote anchor.
@@ -268,7 +267,7 @@ func testChannelBackupRestoreBasic(ht *lntest.HarnessTest) {
 				// the node from seed, then manually recover
 				// the channel backup.
 				return chanRestoreViaRPC(
-					st, password, mnemonic, multi, oldNode,
+					st, password, mnemonic, multi,
 				)
 			},
 		},
@@ -285,14 +284,14 @@ func testChannelBackupRestoreBasic(ht *lntest.HarnessTest) {
 
 				// Read the entire Multi backup stored within
 				// this node's channel.backup file.
-				multi, err := ioutil.ReadFile(backupFilePath)
+				multi, err := os.ReadFile(backupFilePath)
 				require.NoError(st, err)
 
 				// Now that we have Dave's backup file, we'll
 				// create a new nodeRestorer that will restore
 				// using the on-disk channel.backup.
 				return chanRestoreViaRPC(
-					st, password, mnemonic, multi, oldNode,
+					st, password, mnemonic, multi,
 				)
 			},
 		},
@@ -376,7 +375,7 @@ func testChannelBackupRestoreBasic(ht *lntest.HarnessTest) {
 
 				// Read the entire Multi backup stored within
 				// this node's channel.backup file.
-				multi, err := ioutil.ReadFile(backupFilePath)
+				multi, err := os.ReadFile(backupFilePath)
 				require.NoError(st, err)
 
 				// Now that we have Dave's backup file, we'll
@@ -501,7 +500,7 @@ func runChanRestoreScenarioUnConfirmed(ht *lntest.HarnessTest, useFile bool) {
 		backupFilePath := dave.Cfg.ChanBackupPath()
 		// Read the entire Multi backup stored within this node's
 		// channel.backup file.
-		multi, err = ioutil.ReadFile(backupFilePath)
+		multi, err = os.ReadFile(backupFilePath)
 		require.NoError(ht, err)
 	} else {
 		// For this restoration method, we'll grab the current
@@ -524,7 +523,7 @@ func runChanRestoreScenarioUnConfirmed(ht *lntest.HarnessTest, useFile bool) {
 	// In our nodeRestorer function, we'll restore the node from seed, then
 	// manually recover the channel backup.
 	restoredNodeFunc := chanRestoreViaRPC(
-		ht, crs.password, crs.mnemonic, multi, dave,
+		ht, crs.password, crs.mnemonic, multi,
 	)
 
 	// Test the scenario.
@@ -625,8 +624,8 @@ func runChanRestoreScenarioCommitTypes(ht *lntest.HarnessTest,
 
 	var fundingShim *lnrpc.FundingShim
 	if ct == lnrpc.CommitmentType_SCRIPT_ENFORCED_LEASE {
-		_, minerHeight := ht.Miner.GetBestBlock()
-		thawHeight := uint32(minerHeight + thawHeightDelta)
+		minerHeight := ht.CurrentHeight()
+		thawHeight := minerHeight + thawHeightDelta
 
 		fundingShim, _ = deriveFundingShim(
 			ht, dave, carol, crs.params.Amt, thawHeight, true, ct,
@@ -646,7 +645,7 @@ func runChanRestoreScenarioCommitTypes(ht *lntest.HarnessTest,
 
 	// Read the entire Multi backup stored within this node's
 	// channels.backup file.
-	multi, err := ioutil.ReadFile(backupFilePath)
+	multi, err := os.ReadFile(backupFilePath)
 	require.NoError(ht, err)
 
 	// If this was a zero conf taproot channel, then since it's private,
@@ -659,7 +658,7 @@ func runChanRestoreScenarioCommitTypes(ht *lntest.HarnessTest,
 	// Now that we have Dave's backup file, we'll create a new nodeRestorer
 	// that we'll restore using the on-disk channels.backup.
 	restoredNodeFunc := chanRestoreViaRPC(
-		ht, crs.password, crs.mnemonic, multi, dave,
+		ht, crs.password, crs.mnemonic, multi,
 	)
 
 	// Test the scenario.
@@ -688,7 +687,7 @@ func testChannelBackupRestoreLegacy(ht *lntest.HarnessTest) {
 	// In our nodeRestorer function, we'll restore the node from seed, then
 	// manually recover the channel backup.
 	restoredNodeFunc := chanRestoreViaRPC(
-		ht, crs.password, crs.mnemonic, multi, dave,
+		ht, crs.password, crs.mnemonic, multi,
 	)
 
 	// Test the scenario.
@@ -774,17 +773,17 @@ func runChanRestoreScenarioForceClose(ht *lntest.HarnessTest, zeroConf bool) {
 
 	// Read the entire Multi backup stored within this node's
 	// channel.backup file.
-	multi, err := ioutil.ReadFile(backupFilePath)
+	multi, err := os.ReadFile(backupFilePath)
 	require.NoError(ht, err)
 
 	// Now that we have Dave's backup file, we'll create a new nodeRestorer
 	// that will restore using the on-disk channel.backup.
 	restoredNodeFunc := chanRestoreViaRPC(
-		ht, crs.password, crs.mnemonic, multi, dave,
+		ht, crs.password, crs.mnemonic, multi,
 	)
 
 	// We now wait until both Dave's closing tx.
-	ht.Miner.AssertNumTxsInMempool(1)
+	ht.AssertNumTxsInMempool(1)
 
 	// Now that we're able to make our restored now, we'll shutdown the old
 	// Dave node as we'll be storing it shortly below.
@@ -907,7 +906,7 @@ func testChannelBackupUpdates(ht *lntest.HarnessTest) {
 	// the on disk back up file to our currentBackup pointer above.
 	assertBackupFileState := func() {
 		err := wait.NoError(func() error {
-			packedBackup, err := ioutil.ReadFile(backupFilePath)
+			packedBackup, err := os.ReadFile(backupFilePath)
 			if err != nil {
 				return fmt.Errorf("unable to read backup "+
 					"file: %v", err)
@@ -1266,8 +1265,14 @@ func testDataLossProtection(ht *lntest.HarnessTest) {
 	// information Dave needs to sweep his funds.
 	require.NoError(ht, restartDave(), "unable to restart Eve")
 
+	// Dave should have a pending sweep.
+	ht.AssertNumPendingSweeps(dave, 1)
+
+	// Mine a block to trigger the sweep.
+	ht.MineBlocks(1)
+
 	// Dave should sweep his funds.
-	ht.Miner.AssertNumTxsInMempool(1)
+	ht.AssertNumTxsInMempool(1)
 
 	// Mine a block to confirm the sweep, and make sure Dave got his
 	// balance back.
@@ -1383,8 +1388,7 @@ func createLegacyRevocationChannel(ht *lntest.HarnessTest,
 // instance which will restore the target node from a password+seed, then
 // trigger a SCB restore using the RPC interface.
 func chanRestoreViaRPC(ht *lntest.HarnessTest, password []byte,
-	mnemonic []string, multi []byte,
-	oldNode *node.HarnessNode) nodeRestorer {
+	mnemonic []string, multi []byte) nodeRestorer {
 
 	backup := &lnrpc.RestoreChanBackupRequest_MultiChanBackup{
 		MultiChanBackup: multi,
@@ -1411,13 +1415,19 @@ func chanRestoreViaRPC(ht *lntest.HarnessTest, password []byte,
 func assertTimeLockSwept(ht *lntest.HarnessTest, carol, dave *node.HarnessNode,
 	carolStartingBalance, daveStartingBalance int64) {
 
-	// We expect Carol to sweep her funds and also the anchor tx. In
-	// addition, Dave will also sweep his anchor output.
-	expectedTxes := 3
-
 	// Carol should sweep her funds immediately, as they are not
 	// timelocked.
-	ht.Miner.AssertNumTxsInMempool(expectedTxes)
+	ht.AssertNumPendingSweeps(carol, 2)
+	ht.AssertNumPendingSweeps(dave, 1)
+
+	// We expect Carol to sweep her funds and her anchor in a single sweep
+	// tx. In addition, Dave will attempt to sweep his anchor output but
+	// fail due to the sweeping tx being uneconomical.
+	expectedTxes := 1
+
+	// Mine a block to trigger the sweeps.
+	ht.MineBlocks(1)
+	ht.AssertNumTxsInMempool(expectedTxes)
 
 	// Carol should consider the channel pending force close (since she is
 	// waiting for her sweep to confirm).
@@ -1444,12 +1454,16 @@ func assertTimeLockSwept(ht *lntest.HarnessTest, carol, dave *node.HarnessNode,
 	// After the Dave's output matures, he should reclaim his funds.
 	//
 	// The commit sweep resolver publishes the sweep tx at defaultCSV-1 and
-	// we already mined one block after the commitment was published, so
-	// take that into account.
-	ht.MineBlocks(defaultCSV - 1 - 1)
-	daveSweep := ht.Miner.AssertNumTxsInMempool(1)[0]
+	// we already mined one block after the commitment was published, and
+	// one block to trigger Carol's sweeps, so take that into account.
+	ht.MineEmptyBlocks(1)
+	ht.AssertNumPendingSweeps(dave, 2)
+
+	// Mine a block to trigger the sweeps.
+	ht.MineEmptyBlocks(1)
+	daveSweep := ht.AssertNumTxsInMempool(1)[0]
 	block := ht.MineBlocksAndAssertNumTxes(1, 1)[0]
-	ht.Miner.AssertTxInBlock(block, daveSweep)
+	ht.AssertTxInBlock(block, daveSweep)
 
 	// Now the channel should be fully closed also from Dave's POV.
 	ht.AssertNumPendingForceClose(dave, 0)
@@ -1495,7 +1509,7 @@ func assertDLPExecuted(ht *lntest.HarnessTest,
 
 	// Upon reconnection, the nodes should detect that Dave is out of sync.
 	// Carol should force close the channel using her latest commitment.
-	ht.Miner.AssertNumTxsInMempool(1)
+	ht.AssertNumTxsInMempool(1)
 
 	// Channel should be in the state "waiting close" for Carol since she
 	// broadcasted the force close tx.
@@ -1526,11 +1540,12 @@ func assertDLPExecuted(ht *lntest.HarnessTest,
 		// Dave should sweep his anchor only, since he still has the
 		// lease CLTV constraint on his commitment output. We'd also
 		// see Carol's anchor sweep here.
-		ht.Miner.AssertNumTxsInMempool(2)
 
-		// Mine anchor sweep txes for Carol and Dave.
-		ht.MineBlocksAndAssertNumTxes(1, 2)
-		blocksMined++
+		// Both Dave and Carol should have an anchor sweep request.
+		// Note that they cannot sweep them as these anchor sweepings
+		// are uneconomical.
+		ht.AssertNumPendingSweeps(dave, 1)
+		ht.AssertNumPendingSweeps(carol, 1)
 
 		// After Carol's output matures, she should also reclaim her
 		// funds.
@@ -1538,7 +1553,14 @@ func assertDLPExecuted(ht *lntest.HarnessTest,
 		// The commit sweep resolver publishes the sweep tx at
 		// defaultCSV-1 and we already mined one block after the
 		// commitmment was published, so take that into account.
-		ht.MineBlocks(defaultCSV - blocksMined)
+		ht.MineEmptyBlocks(int(defaultCSV - blocksMined))
+
+		// Carol should have two sweep requests - one for her commit
+		// output and the other for her anchor.
+		ht.AssertNumPendingSweeps(carol, 2)
+
+		// Mine a block to trigger the sweep.
+		ht.MineEmptyBlocks(1)
 		ht.MineBlocksAndAssertNumTxes(1, 1)
 
 		// Now the channel should be fully closed also from Carol's POV.
@@ -1551,7 +1573,14 @@ func assertDLPExecuted(ht *lntest.HarnessTest,
 			resp.PendingForceClosingChannels[0].BlocksTilMaturity
 		require.Positive(ht, blocksTilMaturity)
 
-		ht.MineBlocks(uint32(blocksTilMaturity))
+		ht.MineEmptyBlocks(int(blocksTilMaturity))
+
+		// Dave should have two sweep requests - one for his commit
+		// output and the other for his anchor.
+		ht.AssertNumPendingSweeps(dave, 2)
+
+		// Mine a block to trigger the sweep.
+		ht.MineEmptyBlocks(1)
 		ht.MineBlocksAndAssertNumTxes(1, 1)
 
 		// Now Dave should consider the channel fully closed.
@@ -1559,13 +1588,22 @@ func assertDLPExecuted(ht *lntest.HarnessTest,
 	} else {
 		// Dave should sweep his funds immediately, as they are not
 		// timelocked. We also expect Carol and Dave sweep their
-		// anchors.
+		// anchors if it's an anchor channel.
 		if lntest.CommitTypeHasAnchors(commitType) {
-			ht.MineBlocksAndAssertNumTxes(1, 3)
+			ht.AssertNumPendingSweeps(carol, 1)
+			ht.AssertNumPendingSweeps(dave, 2)
 		} else {
-			ht.MineBlocksAndAssertNumTxes(1, 1)
+			ht.AssertNumPendingSweeps(dave, 1)
 		}
 
+		// Mine one block to trigger the sweeper to sweep.
+		ht.MineEmptyBlocks(1)
+		blocksMined++
+
+		// Expect one tx - the commitment sweep from Dave. For anchor
+		// channels, we expect the two anchor sweeping txns to be
+		// failed due they are uneconomical.
+		ht.MineBlocksAndAssertNumTxes(1, 1)
 		blocksMined++
 
 		// Now Dave should consider the channel fully closed.
@@ -1577,7 +1615,21 @@ func assertDLPExecuted(ht *lntest.HarnessTest,
 		// The commit sweep resolver publishes the sweep tx at
 		// defaultCSV-1 and we already have blocks mined after the
 		// commitmment was published, so take that into account.
-		ht.MineBlocks(defaultCSV - blocksMined)
+		ht.MineEmptyBlocks(int(defaultCSV - blocksMined))
+
+		// Mine one block to trigger the sweeper to sweep.
+		ht.MineEmptyBlocks(1)
+
+		// Carol should have two pending sweeps:
+		// 1. her commit output.
+		// 2. her anchor output, if this is anchor channel.
+		if lntest.CommitTypeHasAnchors(commitType) {
+			ht.AssertNumPendingSweeps(carol, 2)
+		} else {
+			ht.AssertNumPendingSweeps(carol, 1)
+		}
+
+		// Assert the sweeping tx is mined.
 		ht.MineBlocksAndAssertNumTxes(1, 1)
 
 		// Now the channel should be fully closed also from Carol's

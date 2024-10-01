@@ -334,7 +334,8 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		}
 		for _, coin := range manuallySelectedCoins {
 			if _, ok := unspent[coin.OutPoint]; !ok {
-				return fmt.Errorf("outpoint already spent: %v",
+				return fmt.Errorf("outpoint already spent or "+
+					"locked by another subsystem: %v",
 					coin.OutPoint)
 			}
 		}
@@ -393,7 +394,6 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		// we will call the specialized coin selection function for
 		// that.
 		case r.FundUpToMaxAmt != 0 && r.MinFundAmt != 0:
-
 			// We need to ensure that manually selected coins, which
 			// are spent entirely on the channel funding, leave
 			// enough funds in the wallet to cover for a reserve.
@@ -524,7 +524,7 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		for _, coin := range selectedCoins {
 			outpoint := coin.OutPoint
 
-			_, _, _, err = w.cfg.CoinLeaser.LeaseOutput(
+			_, err = w.cfg.CoinLeaser.LeaseOutput(
 				LndInternalLockID, outpoint,
 				DefaultReservationTimeout,
 			)
@@ -538,6 +538,7 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 				localFundingAmt:  localContributionAmt,
 				remoteFundingAmt: r.RemoteAmt,
 				musig2:           r.Musig2,
+				tapscriptRoot:    r.TapscriptRoot,
 			},
 			InputCoins: selectedCoins,
 			coinLeaser: w.cfg.CoinLeaser,

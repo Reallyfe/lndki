@@ -3,7 +3,6 @@ package contractcourt
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"testing"
 
 	sphinx "github.com/lightningnetwork/lightning-onion"
@@ -264,7 +263,7 @@ type mockHopIterator struct {
 	hop.Iterator
 }
 
-func (h *mockHopIterator) HopPayload() (*hop.Payload, error) {
+func (h *mockHopIterator) HopPayload() (*hop.Payload, hop.RouteRole, error) {
 	var nextAddress [8]byte
 	if !h.isExit {
 		nextAddress = [8]byte{0x01}
@@ -276,7 +275,7 @@ func (h *mockHopIterator) HopPayload() (*hop.Payload, error) {
 		ForwardAmount: 100,
 		OutgoingCltv:  40,
 		ExtraBytes:    [12]byte{},
-	}), nil
+	}), hop.RouteRoleCleartext, nil
 }
 
 func (h *mockHopIterator) EncodeNextHop(w io.Writer) error {
@@ -291,7 +290,7 @@ type mockOnionProcessor struct {
 func (o *mockOnionProcessor) ReconstructHopIterator(r io.Reader, rHash []byte,
 	_ hop.ReconstructBlindingInfo) (hop.Iterator, error) {
 
-	data, err := ioutil.ReadAll(r)
+	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
@@ -351,6 +350,12 @@ func newIncomingResolverTestContext(t *testing.T, isExit bool) *incomingResolver
 				return nil
 			},
 			HtlcNotifier: htlcNotifier,
+			Budget:       *DefaultBudgetConfig(),
+			QueryIncomingCircuit: func(
+				circuit models.CircuitKey) *models.CircuitKey {
+
+				return nil
+			},
 		},
 		PutResolverReport: func(_ kvdb.RwTx,
 			_ *channeldb.ResolverReport) error {
@@ -390,7 +395,7 @@ func (i *incomingResolverTestContext) resolve() {
 	i.resolveErr = make(chan error, 1)
 	go func() {
 		var err error
-		i.nextResolver, err = i.resolver.Resolve()
+		i.nextResolver, err = i.resolver.Resolve(false)
 		i.resolveErr <- err
 	}()
 

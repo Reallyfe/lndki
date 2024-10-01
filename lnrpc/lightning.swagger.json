@@ -1204,6 +1204,13 @@
             "required": true,
             "type": "string",
             "format": "uint64"
+          },
+          {
+            "name": "chan_point",
+            "description": "The channel point of the channel in format funding_txid:output_index. If\nchan_id is specified, this field is ignored.",
+            "in": "query",
+            "required": false,
+            "type": "string"
           }
         ],
         "tags": [
@@ -1470,6 +1477,8 @@
                 "ANCHORS_OPT",
                 "ANCHORS_ZERO_FEE_HTLC_REQ",
                 "ANCHORS_ZERO_FEE_HTLC_OPT",
+                "ROUTE_BLINDING_REQUIRED",
+                "ROUTE_BLINDING_OPTIONAL",
                 "AMP_REQ",
                 "AMP_OPT"
               ]
@@ -2265,6 +2274,13 @@
           {
             "name": "failed_htlcs_only",
             "description": "Only delete failed HTLCs from payments, not the payment itself.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "all_payments",
+            "description": "Delete all payments. NOTE: Using this option requires careful\nconsideration as it is a destructive operation.",
             "in": "query",
             "required": false,
             "type": "boolean"
@@ -3111,6 +3127,11 @@
         "memo": {
           "type": "string",
           "description": "An optional note-to-self to go along with the channel containing some\nuseful information. This is only ever stored locally and in no way\nimpacts the channel's operation."
+        },
+        "custom_channel_data": {
+          "type": "string",
+          "format": "byte",
+          "description": "Custom channel data that might be populated in custom channels."
         }
       }
     },
@@ -3528,6 +3549,34 @@
         }
       }
     },
+    "lnrpcBlindedPathConfig": {
+      "type": "object",
+      "properties": {
+        "min_num_real_hops": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The minimum number of real hops to include in a blinded path. This doesn't\ninclude our node, so if the minimum is 1, then the path will contain at\nminimum our node along with an introduction node hop. If it is zero then\nthe shortest path will use our node as an introduction node."
+        },
+        "num_hops": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The number of hops to include in a blinded path. This doesn't include our\nnode, so if it is 1, then the path will contain our node along with an\nintroduction node or dummy node hop. If paths shorter than NumHops is\nfound, then they will be padded using dummy hops."
+        },
+        "max_num_paths": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The maximum number of blinded paths to select and add to an invoice."
+        },
+        "node_omission_list": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "A list of node IDs of nodes that should not be used in any of our generated\nblinded paths."
+        }
+      }
+    },
     "lnrpcBlindedPaymentPath": {
       "type": "object",
       "properties": {
@@ -3805,6 +3854,11 @@
         "memo": {
           "type": "string",
           "description": "An optional note-to-self to go along with the channel containing some\nuseful information. This is only ever stored locally and in no way impacts\nthe channel's operation."
+        },
+        "custom_channel_data": {
+          "type": "string",
+          "format": "byte",
+          "description": "Custom channel data that might be populated in custom channels."
         }
       }
     },
@@ -4008,6 +4062,11 @@
         "pending_open_remote_balance": {
           "$ref": "#/definitions/lnrpcAmount",
           "description": "Sum of channels pending remote balances."
+        },
+        "custom_channel_data": {
+          "type": "string",
+          "format": "byte",
+          "description": "Custom channel data that might be populated if there are custom channels\npresent."
         }
       }
     },
@@ -4097,6 +4156,21 @@
         },
         "success": {
           "type": "boolean"
+        },
+        "local_close_output": {
+          "$ref": "#/definitions/lnrpcCloseOutput",
+          "description": "The local channel close output. If the local channel balance was dust to\nbegin with, this output will not be set."
+        },
+        "remote_close_output": {
+          "$ref": "#/definitions/lnrpcCloseOutput",
+          "description": "The remote channel close output. If the remote channel balance was dust\nto begin with, this output will not be set."
+        },
+        "additional_outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/lnrpcCloseOutput"
+          },
+          "description": "Any additional outputs that might be added for custom channel types."
         }
       }
     },
@@ -4406,6 +4480,30 @@
         }
       }
     },
+    "lnrpcCloseOutput": {
+      "type": "object",
+      "properties": {
+        "amount_sat": {
+          "type": "string",
+          "format": "int64",
+          "description": "The amount in satoshi of this close output. This amount is the final\ncommitment balance of the channel and the actual amount paid out on chain\nmight be smaller due to subtracted fees."
+        },
+        "pk_script": {
+          "type": "string",
+          "format": "byte",
+          "description": "The pkScript of the close output."
+        },
+        "is_local": {
+          "type": "boolean",
+          "description": "Whether this output is for the local or remote node."
+        },
+        "custom_channel_data": {
+          "type": "string",
+          "format": "byte",
+          "description": "The TLV encoded custom channel data records for this output, which might\nbe set for custom channels."
+        }
+      }
+    },
     "lnrpcCloseStatusUpdate": {
       "type": "object",
       "properties": {
@@ -4687,6 +4785,8 @@
         "ANCHORS_OPT",
         "ANCHORS_ZERO_FEE_HTLC_REQ",
         "ANCHORS_ZERO_FEE_HTLC_OPT",
+        "ROUTE_BLINDING_REQUIRED",
+        "ROUTE_BLINDING_OPTIONAL",
         "AMP_REQ",
         "AMP_OPT"
       ],
@@ -5286,6 +5386,21 @@
         }
       }
     },
+    "lnrpcInboundFee": {
+      "type": "object",
+      "properties": {
+        "base_fee_msat": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The inbound base fee charged regardless of the number of milli-satoshis\nreceived in the channel. By default, only negative values are accepted."
+        },
+        "fee_rate_ppm": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The effective inbound fee rate in micro-satoshis (parts per million).\nBy default, only negative values are accepted."
+        }
+      }
+    },
     "lnrpcInitiator": {
       "type": "string",
       "enum": [
@@ -5457,6 +5572,14 @@
           },
           "description": "Maps a 32-byte hex-encoded set ID to the sub-invoice AMP state for the\ngiven set ID. This field is always populated for AMP invoices, and can be\nused along side LookupInvoice to obtain the HTLC information related to a\ngiven sub-invoice.\nNote: Output only, don't specify for creating an invoice.",
           "title": "[EXPERIMENTAL]:"
+        },
+        "is_blinded": {
+          "type": "boolean",
+          "description": "Signals that the invoice should include blinded paths to hide the true\nidentity of the recipient."
+        },
+        "blinded_path_config": {
+          "$ref": "#/definitions/lnrpcBlindedPathConfig",
+          "description": "Config values to use when creating blinded paths for this invoice. These\ncan be used to override the defaults config values provided in by the\nglobal config. This field is only used if is_blinded is true."
         }
       }
     },
@@ -5518,6 +5641,11 @@
         "amp": {
           "$ref": "#/definitions/lnrpcAMP",
           "description": "Details relevant to AMP HTLCs, only populated if this is an AMP HTLC."
+        },
+        "custom_channel_data": {
+          "type": "string",
+          "format": "byte",
+          "description": "Custom channel data that might be populated in custom channels."
         }
       },
       "title": "Details of an HTLC that paid to an invoice"
@@ -6266,6 +6394,12 @@
           "additionalProperties": {
             "$ref": "#/definitions/lnrpcFeature"
           }
+        },
+        "blinded_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/lnrpcBlindedPaymentPath"
+          }
         }
       }
     },
@@ -6342,6 +6476,14 @@
         },
         "failure_reason": {
           "$ref": "#/definitions/lnrpcPaymentFailureReason"
+        },
+        "first_hop_custom_records": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "The custom TLV records that were sent to the first hop as part of the HTLC\nwire message for this payment."
         }
       }
     },
@@ -6353,10 +6495,11 @@
         "FAILURE_REASON_NO_ROUTE",
         "FAILURE_REASON_ERROR",
         "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
-        "FAILURE_REASON_INSUFFICIENT_BALANCE"
+        "FAILURE_REASON_INSUFFICIENT_BALANCE",
+        "FAILURE_REASON_CANCELED"
       ],
       "default": "FAILURE_REASON_NONE",
-      "description": " - FAILURE_REASON_NONE: Payment isn't failed (yet).\n - FAILURE_REASON_TIMEOUT: There are more routes to try, but the payment timeout was exceeded.\n - FAILURE_REASON_NO_ROUTE: All possible routes were tried and failed permanently. Or were no\nroutes to the destination at all.\n - FAILURE_REASON_ERROR: A non-recoverable error has occured.\n - FAILURE_REASON_INCORRECT_PAYMENT_DETAILS: Payment details incorrect (unknown hash, invalid amt or\ninvalid final cltv delta)\n - FAILURE_REASON_INSUFFICIENT_BALANCE: Insufficient local balance."
+      "description": " - FAILURE_REASON_NONE: Payment isn't failed (yet).\n - FAILURE_REASON_TIMEOUT: There are more routes to try, but the payment timeout was exceeded.\n - FAILURE_REASON_NO_ROUTE: All possible routes were tried and failed permanently. Or were no\nroutes to the destination at all.\n - FAILURE_REASON_ERROR: A non-recoverable error has occured.\n - FAILURE_REASON_INCORRECT_PAYMENT_DETAILS: Payment details incorrect (unknown hash, invalid amt or\ninvalid final cltv delta)\n - FAILURE_REASON_INSUFFICIENT_BALANCE: Insufficient local balance.\n - FAILURE_REASON_CANCELED: The payment was canceled."
     },
     "lnrpcPeer": {
       "type": "object",
@@ -6574,13 +6717,9 @@
           "type": "boolean",
           "description": "If true, min_htlc_msat is applied."
         },
-        "inbound_base_fee_msat": {
-          "type": "integer",
-          "format": "int32"
-        },
-        "inbound_fee_rate_ppm": {
-          "type": "integer",
-          "format": "int32"
+        "inbound_fee": {
+          "$ref": "#/definitions/lnrpcInboundFee",
+          "description": "Optional inbound fee. If unset, the previously set value will be\nretained [EXPERIMENTAL]."
         }
       }
     },
@@ -6832,6 +6971,16 @@
           "type": "string",
           "format": "int64",
           "description": "The total amount in millisatoshis."
+        },
+        "first_hop_amount_msat": {
+          "type": "string",
+          "format": "int64",
+          "description": "The actual on-chain amount that was sent out to the first hop. This value is\nonly different from the total_amt_msat field if this is a custom channel\npayment and the value transported in the HTLC is different from the BTC\namount in the HTLC. If this value is zero, then this is an old payment that\ndidn't have this value yet and can be ignored."
+        },
+        "custom_channel_data": {
+          "type": "string",
+          "format": "byte",
+          "description": "Custom channel data that might be populated in custom channels."
         }
       },
       "description": "A path through the channel graph which runs over one or more channels in\nsuccession. This struct carries all the information required to craft the\nSphinx onion packet, and send the payment along the first hop in the path. A\nroute is only selected as valid if all the channels have sufficient capacity to\ncarry the initial payment amount after fees are accounted for."
@@ -6925,7 +7074,7 @@
         },
         "send_all": {
           "type": "boolean",
-          "description": "If set, then the amount field will be ignored, and lnd will attempt to\nsend all the coins under control of the internal wallet to the specified\naddress."
+          "description": "If set, the amount field should be unset. It indicates lnd will send all\nwallet coins or all selected coins to the specified address."
         },
         "label": {
           "type": "string",
@@ -6943,6 +7092,13 @@
         "coin_selection_strategy": {
           "$ref": "#/definitions/lnrpcCoinSelectionStrategy",
           "description": "The strategy to use for selecting coins."
+        },
+        "outpoints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/lnrpcOutPoint"
+          },
+          "description": "A list of selected outpoints as inputs for the transaction."
         }
       }
     },

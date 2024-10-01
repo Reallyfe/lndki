@@ -67,10 +67,10 @@ func newBackupTask(id wtdb.BackupID, sweepPkScript []byte) *backupTask {
 func (t *backupTask) inputs() map[wire.OutPoint]input.Input {
 	inputs := make(map[wire.OutPoint]input.Input)
 	if t.toLocalInput != nil {
-		inputs[*t.toLocalInput.OutPoint()] = t.toLocalInput
+		inputs[t.toLocalInput.OutPoint()] = t.toLocalInput
 	}
 	if t.toRemoteInput != nil {
-		inputs[*t.toRemoteInput.OutPoint()] = t.toRemoteInput
+		inputs[t.toRemoteInput.OutPoint()] = t.toRemoteInput
 	}
 
 	return inputs
@@ -216,7 +216,7 @@ func (t *backupTask) bindSession(session *wtdb.ClientSessionBody,
 	// Now, compute the output values depending on whether FlagReward is set
 	// in the current session's policy.
 	outputs, err := session.Policy.ComputeJusticeTxOuts(
-		t.totalAmt, int64(weightEstimate.Weight()),
+		t.totalAmt, weightEstimate.Weight(),
 		t.sweepPkScript, session.RewardPkScript,
 	)
 	if err != nil {
@@ -297,7 +297,7 @@ func (t *backupTask) craftSessionPayload(
 	commitType := t.commitmentType
 	for _, inp := range inputs {
 		// Lookup the input's new post-sort position.
-		i := inputIndex[*inp.OutPoint()]
+		i := inputIndex[inp.OutPoint()]
 
 		// Construct the full witness required to spend this input.
 		inputScript, err := inp.CraftInputScript(

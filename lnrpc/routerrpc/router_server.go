@@ -6,7 +6,6 @@ import (
 	crand "crypto/rand"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -15,7 +14,9 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/lightningnetwork/lnd/aliasmgr"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -54,6 +55,14 @@ var (
 	errMissingRoute = errors.New("missing route")
 
 	errUnexpectedFailureSource = errors.New("unexpected failure source")
+
+	// ErrAliasAlreadyExists is returned if a new SCID alias is attempted
+	// to be added that already exists.
+	ErrAliasAlreadyExists = errors.New("alias already exists")
+
+	// ErrNoValidAlias is returned if an alias is not in the valid range for
+	// allowed SCID aliases.
+	ErrNoValidAlias = errors.New("not a valid alias")
 
 	// macaroonOps are the set of capabilities that our minted macaroon (if
 	// it doesn't already exist) will have.
@@ -142,6 +151,14 @@ var (
 			Entity: "offchain",
 			Action: "write",
 		}},
+		"/routerrpc.Router/XAddLocalChanAliases": {{
+			Entity: "offchain",
+			Action: "write",
+		}},
+		"/routerrpc.Router/XDeleteLocalChanAliases": {{
+			Entity: "offchain",
+			Action: "write",
+		}},
 	}
 
 	// DefaultRouterMacFilename is the default name of the router macaroon
@@ -150,14 +167,14 @@ var (
 	DefaultRouterMacFilename = "router.macaroon"
 )
 
-// ServerShell a is shell struct holding a reference to the actual sub-server.
+// ServerShell is a shell struct holding a reference to the actual sub-server.
 // It is used to register the gRPC sub-server with the root server before we
 // have the necessary dependencies to populate the actual sub-server.
 type ServerShell struct {
 	RouterServer
 }
 
-// Server is a stand alone sub RPC server which exposes functionality that
+// Server is a stand-alone sub RPC server which exposes functionality that
 // allows clients to route arbitrary payment through the Lightning Network.
 type Server struct {
 	started                  int32 // To be used atomically.
@@ -182,7 +199,7 @@ var _ RouterServer = (*Server)(nil)
 // that contains all external dependencies. If the target macaroon exists, and
 // we're unable to create it, then an error will be returned. We also return
 // the set of permissions that we require as a server. At the time of writing
-// of this documentation, this is the same macaroon as as the admin macaroon.
+// of this documentation, this is the same macaroon as the admin macaroon.
 func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
 	// If the path of the router macaroon wasn't generated, then we'll
 	// assume that it's found at the default network directory.
@@ -216,7 +233,7 @@ func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		err = ioutil.WriteFile(macFilePath, routerMacBytes, 0644)
+		err = os.WriteFile(macFilePath, routerMacBytes, 0644)
 		if err != nil {
 			_ = os.Remove(macFilePath)
 			return nil, nil, err
@@ -361,13 +378,25 @@ func (s *Server) SendPaymentV2(req *SendPaymentRequest,
 		return err
 	}
 
+	// The payment context is influenced by two user-provided parameters,
+	// the cancelable flag and the payment attempt timeout.
+	// If the payment is cancelable, we will use the stream context as the
+	// payment context. That way, if the user ends the stream, the payment
+	// loop will be canceled.
+	// The second context parameter is the timeout. If the user provides a
+	// timeout, we will additionally wrap the context in a deadline. If the
+	// user provided 'cancelable' and ends the stream before the timeout is
+	// reached the payment will be canceled.
+	ctx := context.Background()
+	if req.Cancelable {
+		ctx = stream.Context()
+	}
+
 	// Send the payment asynchronously.
-	s.cfg.Router.SendPaymentAsync(payment, paySession, shardTracker)
+	s.cfg.Router.SendPaymentAsync(ctx, payment, paySession, shardTracker)
 
 	// Track the payment and return.
-	return s.trackPayment(
-		sub, payHash, stream, req.NoInflightUpdates,
-	)
+	return s.trackPayment(sub, payHash, stream, req.NoInflightUpdates)
 }
 
 // EstimateRouteFee allows callers to obtain an expected value w.r.t how much it
@@ -499,10 +528,15 @@ func (s *Server) probePaymentRequest(ctx context.Context, paymentRequest string,
 		AmtMsat:          amtMsat,
 		PaymentHash:      paymentHash[:],
 		FeeLimitSat:      routeFeeLimitSat,
-		PaymentAddr:      payReq.PaymentAddr[:],
 		FinalCltvDelta:   int32(payReq.MinFinalCLTVExpiry()),
 		DestFeatures:     MarshalFeatures(payReq.Features),
 	}
+
+	// If the payment addresses is specified, then we'll also populate that
+	// now as well.
+	payReq.PaymentAddr.WhenSome(func(addr [32]byte) {
+		copy(probeRequest.PaymentAddr, addr[:])
+	})
 
 	hints := payReq.RouteHints
 
@@ -835,6 +869,11 @@ func (s *Server) SendToRouteV2(ctx context.Context,
 		return nil, err
 	}
 
+	firstHopRecords := lnwire.CustomRecords(req.FirstHopCustomRecords)
+	if err := firstHopRecords.Validate(); err != nil {
+		return nil, err
+	}
+
 	var attempt *channeldb.HTLCAttempt
 
 	// Pass route to the router. This call returns the full htlc attempt
@@ -844,9 +883,13 @@ func (s *Server) SendToRouteV2(ctx context.Context,
 	// case, we give precedence to the attempt information as stored in the
 	// db.
 	if req.SkipTempErr {
-		attempt, err = s.cfg.Router.SendToRouteSkipTempErr(hash, route)
+		attempt, err = s.cfg.Router.SendToRouteSkipTempErr(
+			hash, route, firstHopRecords,
+		)
 	} else {
-		attempt, err = s.cfg.Router.SendToRoute(hash, route)
+		attempt, err = s.cfg.Router.SendToRoute(
+			hash, route, firstHopRecords,
+		)
 	}
 	if attempt != nil {
 		rpcAttempt, err := s.cfg.RouterBackend.MarshalHTLCAttempt(
@@ -987,9 +1030,8 @@ func (s *Server) SetMissionControlConfig(ctx context.Context,
 				AprioriHopProbability: float64(
 					req.Config.HopProbability,
 				),
-				AprioriWeight: float64(req.Config.Weight),
-				CapacityFraction: float64(
-					routing.DefaultCapacityFraction),
+				AprioriWeight:    float64(req.Config.Weight),
+				CapacityFraction: routing.DefaultCapacityFraction, //nolint:lll
 			}
 		}
 
@@ -1033,8 +1075,8 @@ func (s *Server) SetMissionControlConfig(ctx context.Context,
 
 // QueryMissionControl exposes the internal mission control state to callers. It
 // is a development feature.
-func (s *Server) QueryMissionControl(ctx context.Context,
-	req *QueryMissionControlRequest) (*QueryMissionControlResponse, error) {
+func (s *Server) QueryMissionControl(_ context.Context,
+	_ *QueryMissionControlRequest) (*QueryMissionControlResponse, error) {
 
 	snapshot := s.cfg.RouterBackend.MissionControl.GetHistorySnapshot()
 
@@ -1081,7 +1123,7 @@ func toRPCPairData(data *routing.TimedPairResult) *PairData {
 
 // XImportMissionControl imports the state provided to our internal mission
 // control. Only entries that are fresher than our existing state will be used.
-func (s *Server) XImportMissionControl(ctx context.Context,
+func (s *Server) XImportMissionControl(_ context.Context,
 	req *XImportMissionControlRequest) (*XImportMissionControlResponse,
 	error) {
 
@@ -1138,6 +1180,7 @@ func toPairSnapshot(pairResult *PairHistory) (*routing.MissionControlPairSnapsho
 		lnwire.MilliSatoshi(pairResult.History.FailAmtMsat),
 		btcutil.Amount(pairResult.History.FailAmtSat),
 		pairResult.History.FailTime,
+		true,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%v invalid failure: %w", pairPrefix,
@@ -1148,6 +1191,7 @@ func toPairSnapshot(pairResult *PairHistory) (*routing.MissionControlPairSnapsho
 		lnwire.MilliSatoshi(pairResult.History.SuccessAmtMsat),
 		btcutil.Amount(pairResult.History.SuccessAmtSat),
 		pairResult.History.SuccessTime,
+		false,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%v invalid success: %w", pairPrefix,
@@ -1175,9 +1219,11 @@ func toPairSnapshot(pairResult *PairHistory) (*routing.MissionControlPairSnapsho
 }
 
 // getPair validates the values provided for a mission control result and
-// returns the msat amount and timestamp for it.
+// returns the msat amount and timestamp for it. `isFailure` can be used to
+// default values to 0 instead of returning an error.
 func getPair(amtMsat lnwire.MilliSatoshi, amtSat btcutil.Amount,
-	timestamp int64) (lnwire.MilliSatoshi, time.Time, error) {
+	timestamp int64, isFailure bool) (lnwire.MilliSatoshi, time.Time,
+	error) {
 
 	amt, err := getMsatPairValue(amtMsat, amtSat)
 	if err != nil {
@@ -1190,16 +1236,21 @@ func getPair(amtMsat lnwire.MilliSatoshi, amtSat btcutil.Amount,
 	)
 
 	switch {
+	// If a timestamp and amount if provided, return those values.
 	case timeSet && amountSet:
 		return amt, time.Unix(timestamp, 0), nil
 
-	case timeSet && !amountSet:
+	// Return an error if it does have a timestamp without an amount, and
+	// it's not expected to be a failure.
+	case !isFailure && timeSet && !amountSet:
 		return 0, time.Time{}, errors.New("non-zero timestamp " +
-			"requires non-zero amount")
+			"requires non-zero amount for success pairs")
 
-	case !timeSet && amountSet:
-		return 0, time.Time{}, errors.New("non-zero amount requires " +
-			"non-zero timestamp")
+	// Return an error if it does have an amount without a timestamp, and
+	// it's not expected to be a failure.
+	case !isFailure && !timeSet && amountSet:
+		return 0, time.Time{}, errors.New("non-zero amount for " +
+			"success pairs requires non-zero timestamp")
 
 	default:
 		return 0, time.Time{}, nil
@@ -1265,8 +1316,9 @@ func (s *Server) subscribePayment(identifier lntypes.Hash) (
 	sub, err := router.Tower.SubscribePayment(identifier)
 
 	switch {
-	case err == channeldb.ErrPaymentNotInitiated:
+	case errors.Is(err, channeldb.ErrPaymentNotInitiated):
 		return nil, status.Error(codes.NotFound, err.Error())
+
 	case err != nil:
 		return nil, err
 	}
@@ -1292,7 +1344,7 @@ func (s *Server) trackPayment(subscription routing.ControlTowerSubscriber,
 
 	// Otherwise, we will log and return the error as the stream has
 	// received an error from the payment lifecycle.
-	log.Errorf("TrackPayment got error for payment %x: %v", identifier, err)
+	log.Errorf("TrackPayment got error for payment %v: %v", identifier, err)
 
 	return err
 }
@@ -1377,8 +1429,12 @@ func (s *Server) trackPaymentStream(context context.Context,
 }
 
 // BuildRoute builds a route from a list of hop addresses.
-func (s *Server) BuildRoute(ctx context.Context,
+func (s *Server) BuildRoute(_ context.Context,
 	req *BuildRouteRequest) (*BuildRouteResponse, error) {
+
+	if len(req.HopPubkeys) == 0 {
+		return nil, errors.New("no hops specified")
+	}
 
 	// Unmarshall hop list.
 	hops := make([]route.Vertex, len(req.HopPubkeys))
@@ -1391,10 +1447,10 @@ func (s *Server) BuildRoute(ctx context.Context,
 	}
 
 	// Prepare BuildRoute call parameters from rpc request.
-	var amt *lnwire.MilliSatoshi
+	var amt fn.Option[lnwire.MilliSatoshi]
 	if req.AmtMsat != 0 {
 		rpcAmt := lnwire.MilliSatoshi(req.AmtMsat)
-		amt = &rpcAmt
+		amt = fn.Some(rpcAmt)
 	}
 
 	var outgoingChan *uint64
@@ -1402,12 +1458,12 @@ func (s *Server) BuildRoute(ctx context.Context,
 		outgoingChan = &req.OutgoingChanId
 	}
 
-	var payAddr *[32]byte
+	var payAddr fn.Option[[32]byte]
 	if len(req.PaymentAddr) != 0 {
 		var backingPayAddr [32]byte
 		copy(backingPayAddr[:], req.PaymentAddr)
 
-		payAddr = &backingPayAddr
+		payAddr = fn.Some(backingPayAddr)
 	}
 
 	if req.FinalCltvDelta == 0 {
@@ -1416,9 +1472,26 @@ func (s *Server) BuildRoute(ctx context.Context,
 		)
 	}
 
+	var firstHopBlob fn.Option[[]byte]
+	if len(req.FirstHopCustomRecords) > 0 {
+		firstHopRecords := lnwire.CustomRecords(
+			req.FirstHopCustomRecords,
+		)
+		if err := firstHopRecords.Validate(); err != nil {
+			return nil, err
+		}
+
+		firstHopData, err := firstHopRecords.Serialize()
+		if err != nil {
+			return nil, err
+		}
+		firstHopBlob = fn.Some(firstHopData)
+	}
+
 	// Build the route and return it to the caller.
 	route, err := s.cfg.Router.BuildRoute(
 		amt, hops, outgoingChan, req.FinalCltvDelta, payAddr,
+		firstHopBlob,
 	)
 	if err != nil {
 		return nil, err
@@ -1438,7 +1511,7 @@ func (s *Server) BuildRoute(ctx context.Context,
 
 // SubscribeHtlcEvents creates a uni-directional stream from the server to
 // the client which delivers a stream of htlc events.
-func (s *Server) SubscribeHtlcEvents(req *SubscribeHtlcEventsRequest,
+func (s *Server) SubscribeHtlcEvents(_ *SubscribeHtlcEventsRequest,
 	stream Router_SubscribeHtlcEventsServer) error {
 
 	htlcClient, err := s.cfg.RouterBackend.SubscribeHtlcEvents()
@@ -1487,7 +1560,7 @@ func (s *Server) SubscribeHtlcEvents(req *SubscribeHtlcEventsRequest,
 
 // HtlcInterceptor is a bidirectional stream for streaming interception
 // requests to the caller.
-// Upon connection it does the following:
+// Upon connection, it does the following:
 // 1. Check if there is already a live stream, if yes it rejects the request.
 // 2. Registered a ForwardInterceptor
 // 3. Delivers to the caller every √√ and detect his answer.
@@ -1500,10 +1573,129 @@ func (s *Server) HtlcInterceptor(stream Router_HtlcInterceptorServer) error {
 	}
 	defer atomic.CompareAndSwapInt32(&s.forwardInterceptorActive, 1, 0)
 
-	// run the forward interceptor.
+	// Run the forward interceptor.
 	return newForwardInterceptor(
 		s.cfg.RouterBackend.InterceptableForwarder, stream,
 	).run()
+}
+
+// XAddLocalChanAliases is an experimental API that creates a set of new
+// channel SCID alias mappings. The final total set of aliases in the manager
+// after the add operation is returned. This is only a locally stored alias, and
+// will not be communicated to the channel peer via any message. Therefore,
+// routing over such an alias will only work if the peer also calls this same
+// RPC on their end. If an alias already exists, an error is returned.
+func (s *Server) XAddLocalChanAliases(_ context.Context,
+	in *AddAliasesRequest) (*AddAliasesResponse, error) {
+
+	existingAliases := s.cfg.AliasMgr.ListAliases()
+
+	// aliasExists checks if the new alias already exists in the alias map.
+	aliasExists := func(newAlias uint64,
+		baseScid lnwire.ShortChannelID) (bool, error) {
+
+		// First check that we actually have a channel for the given
+		// base scid. This should succeed for any channel where the
+		// option-scid-alias feature bit was negotiated.
+		if _, ok := existingAliases[baseScid]; !ok {
+			return false, fmt.Errorf("base scid %v not found",
+				baseScid)
+		}
+
+		for base, aliases := range existingAliases {
+			for _, alias := range aliases {
+				exists := alias.ToUint64() == newAlias
+
+				// Trying to add an alias that we already have
+				// for another channel is wrong.
+				if exists && base != baseScid {
+					return true, fmt.Errorf("%w: alias %v "+
+						"already exists for base scid "+
+						"%v", ErrAliasAlreadyExists,
+						alias, base)
+				}
+
+				if exists {
+					return true, nil
+				}
+			}
+		}
+
+		return false, nil
+	}
+
+	for _, v := range in.AliasMaps {
+		baseScid := lnwire.NewShortChanIDFromInt(v.BaseScid)
+
+		for _, rpcAlias := range v.Aliases {
+			// If not, let's add it to the alias manager now.
+			aliasScid := lnwire.NewShortChanIDFromInt(rpcAlias)
+
+			// But we only add it, if it's a valid alias, as defined
+			// by the BOLT spec.
+			if !aliasmgr.IsAlias(aliasScid) {
+				return nil, fmt.Errorf("%w: SCID alias %v is "+
+					"not a valid alias", ErrNoValidAlias,
+					aliasScid)
+			}
+
+			exists, err := aliasExists(rpcAlias, baseScid)
+			if err != nil {
+				return nil, err
+			}
+
+			// If the alias already exists, we see that as an error.
+			// This is to avoid "silent" collisions.
+			if exists {
+				return nil, fmt.Errorf("%w: SCID alias %v "+
+					"already exists", ErrAliasAlreadyExists,
+					rpcAlias)
+			}
+
+			err = s.cfg.AliasMgr.AddLocalAlias(
+				aliasScid, baseScid, false, true,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("error adding scid "+
+					"alias, base_scid=%v, alias_scid=%v: "+
+					"%w", baseScid, aliasScid, err)
+			}
+		}
+	}
+
+	return &AddAliasesResponse{
+		AliasMaps: lnrpc.MarshalAliasMap(s.cfg.AliasMgr.ListAliases()),
+	}, nil
+}
+
+// XDeleteLocalChanAliases is an experimental API that deletes a set of alias
+// mappings. The final total set of aliases in the manager after the delete
+// operation is returned. The deletion will not be communicated to the channel
+// peer via any message.
+func (s *Server) XDeleteLocalChanAliases(_ context.Context,
+	in *DeleteAliasesRequest) (*DeleteAliasesResponse,
+	error) {
+
+	for _, v := range in.AliasMaps {
+		baseScid := lnwire.NewShortChanIDFromInt(v.BaseScid)
+
+		for _, alias := range v.Aliases {
+			aliasScid := lnwire.NewShortChanIDFromInt(alias)
+
+			err := s.cfg.AliasMgr.DeleteLocalAlias(
+				aliasScid, baseScid,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("error deleting scid "+
+					"alias, base_scid=%v, alias_scid=%v: "+
+					"%w", baseScid, aliasScid, err)
+			}
+		}
+	}
+
+	return &DeleteAliasesResponse{
+		AliasMaps: lnrpc.MarshalAliasMap(s.cfg.AliasMgr.ListAliases()),
+	}, nil
 }
 
 func extractOutPoint(req *UpdateChanStatusRequest) (*wire.OutPoint, error) {
@@ -1517,7 +1709,7 @@ func extractOutPoint(req *UpdateChanStatusRequest) (*wire.OutPoint, error) {
 }
 
 // UpdateChanStatus allows channel state to be set manually.
-func (s *Server) UpdateChanStatus(ctx context.Context,
+func (s *Server) UpdateChanStatus(_ context.Context,
 	req *UpdateChanStatusRequest) (*UpdateChanStatusResponse, error) {
 
 	outPoint, err := extractOutPoint(req)

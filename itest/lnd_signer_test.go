@@ -289,13 +289,14 @@ func assertSignOutputRaw(ht *lntest.HarnessTest,
 
 	// Send some coins to the generated p2wpkh address.
 	req := &lnrpc.SendCoinsRequest{
-		Addr:   targetAddr.String(),
-		Amount: 800_000,
+		Addr:       targetAddr.String(),
+		Amount:     800_000,
+		TargetConf: 6,
 	}
 	alice.RPC.SendCoins(req)
 
 	// Wait until the TX is found in the mempool.
-	txid := ht.Miner.AssertNumTxsInMempool(1)[0]
+	txid := ht.AssertNumTxsInMempool(1)[0]
 
 	targetOutputIndex := ht.GetOutputIndex(txid, targetAddr.String())
 
@@ -358,7 +359,7 @@ func assertSignOutputRaw(ht *lntest.HarnessTest,
 	})
 
 	// Wait until the spending tx is found.
-	txid = ht.Miner.AssertNumTxsInMempool(1)[0]
+	txid = ht.AssertNumTxsInMempool(1)[0]
 	p2wkhOutputIndex := ht.GetOutputIndex(txid, p2wkhAdrr.String())
 
 	op := &lnrpc.OutPoint{

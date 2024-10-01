@@ -221,7 +221,7 @@ func (nw *nodeWatcher) WaitForChannelPolicyUpdate(
 		select {
 		// Send a watch request every second.
 		case <-ticker.C:
-			// Did the event can close in the meantime? We want to
+			// Did the event chan close in the meantime? We want to
 			// avoid a "close of closed channel" panic since we're
 			// re-using the same event chan for multiple requests.
 			select {
@@ -680,6 +680,18 @@ func CheckChannelPolicy(policy, expectedPolicy *lnrpc.RoutingPolicy) error {
 	if policy.MaxHtlcMsat != expectedPolicy.MaxHtlcMsat {
 		return fmt.Errorf("expected max htlc %v, got %v",
 			expectedPolicy.MaxHtlcMsat, policy.MaxHtlcMsat)
+	}
+	if policy.InboundFeeBaseMsat != expectedPolicy.InboundFeeBaseMsat {
+		return fmt.Errorf("expected inbound base fee %v, got %v",
+			expectedPolicy.InboundFeeBaseMsat,
+			policy.InboundFeeBaseMsat)
+	}
+	if policy.InboundFeeRateMilliMsat !=
+		expectedPolicy.InboundFeeRateMilliMsat {
+
+		return fmt.Errorf("expected inbound fee rate %v, got %v",
+			expectedPolicy.InboundFeeRateMilliMsat,
+			policy.InboundFeeRateMilliMsat)
 	}
 	if policy.Disabled != expectedPolicy.Disabled {
 		return errors.New("edge should be disabled but isn't")

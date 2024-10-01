@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"sync"
 	"time"
@@ -31,6 +32,21 @@ const (
 	unknownFailureSourceIdx = -1
 )
 
+// missionControlDB is an interface that defines the database methods that a
+// single missionControlStore has access to. It allows the missionControlStore
+// to be unaware of the overall DB structure and restricts its access to the DB
+// by only providing it the bucket that it needs to care about.
+type missionControlDB interface {
+	// update can be used to perform reads and writes on the given bucket.
+	update(f func(bkt kvdb.RwBucket) error, reset func()) error
+
+	// view can be used to perform reads on the given bucket.
+	view(f func(bkt kvdb.RBucket) error, reset func()) error
+
+	// purge will delete all the contents in this store.
+	purge() error
+}
+
 // missionControlStore is a bolt db based implementation of a mission control
 // store. It stores the raw payment attempt data from which the internal mission
 // controls state can be rederived on startup. This allows the mission control
@@ -38,12 +54,15 @@ const (
 // Also changes to mission control parameters can be applied to historical data.
 // Finally, it enables importing raw data from an external source.
 type missionControlStore struct {
-	done    chan struct{}
-	wg      sync.WaitGroup
-	db      kvdb.Backend
-	queueMx sync.Mutex
+	done chan struct{}
+	wg   sync.WaitGroup
+	db   missionControlDB
+
+	// queueCond is signalled when items are put into the queue.
+	queueCond *sync.Cond
 
 	// queue stores all pending payment results not yet added to the store.
+	// Access is protected by the queueCond.L mutex.
 	queue *list.List
 
 	// keys holds the stored MC store item keys in the order of storage.
@@ -63,7 +82,7 @@ type missionControlStore struct {
 	flushInterval time.Duration
 }
 
-func newMissionControlStore(db kvdb.Backend, maxRecords int,
+func newMissionControlStore(db missionControlDB, maxRecords int,
 	flushInterval time.Duration) (*missionControlStore, error) {
 
 	var (
@@ -72,13 +91,7 @@ func newMissionControlStore(db kvdb.Backend, maxRecords int,
 	)
 
 	// Create buckets if not yet existing.
-	err := kvdb.Update(db, func(tx kvdb.RwTx) error {
-		resultsBucket, err := tx.CreateTopLevelBucket(resultsKey)
-		if err != nil {
-			return fmt.Errorf("cannot create results bucket: %w",
-				err)
-		}
-
+	err := db.update(func(resultsBucket kvdb.RwBucket) error {
 		// Collect all keys to be able to quickly calculate the
 		// difference when updating the DB state.
 		c := resultsBucket.ReadCursor()
@@ -96,9 +109,12 @@ func newMissionControlStore(db kvdb.Backend, maxRecords int,
 		return nil, err
 	}
 
+	log.Infof("Loaded %d mission control entries", len(keysMap))
+
 	return &missionControlStore{
 		done:          make(chan struct{}),
 		db:            db,
+		queueCond:     sync.NewCond(&sync.Mutex{}),
 		queue:         list.New(),
 		keys:          keys,
 		keysMap:       keysMap,
@@ -109,23 +125,15 @@ func newMissionControlStore(db kvdb.Backend, maxRecords int,
 
 // clear removes all results from the db.
 func (b *missionControlStore) clear() error {
-	b.queueMx.Lock()
-	defer b.queueMx.Unlock()
+	b.queueCond.L.Lock()
+	defer b.queueCond.L.Unlock()
 
-	err := kvdb.Update(b.db, func(tx kvdb.RwTx) error {
-		if err := tx.DeleteTopLevelBucket(resultsKey); err != nil {
-			return err
-		}
-
-		_, err := tx.CreateTopLevelBucket(resultsKey)
-		return err
-	}, func() {})
-
-	if err != nil {
+	if err := b.db.purge(); err != nil {
 		return err
 	}
 
 	b.queue = list.New()
+
 	return nil
 }
 
@@ -133,8 +141,7 @@ func (b *missionControlStore) clear() error {
 func (b *missionControlStore) fetchAll() ([]*paymentResult, error) {
 	var results []*paymentResult
 
-	err := kvdb.View(b.db, func(tx kvdb.RTx) error {
-		resultBucket := tx.ReadBucket(resultsKey)
+	err := b.db.view(func(resultBucket kvdb.RBucket) error {
 		results = make([]*paymentResult, 0)
 
 		return resultBucket.ForEach(func(k, v []byte) error {
@@ -181,7 +188,7 @@ func serializeResult(rp *paymentResult) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
-	if err := channeldb.SerializeRoute(&b, *rp.route); err != nil {
+	if err := serializeRoute(&b, rp.route); err != nil {
 		return nil, nil, err
 	}
 
@@ -203,6 +210,90 @@ func serializeResult(rp *paymentResult) ([]byte, []byte, error) {
 	key := getResultKey(rp)
 
 	return key, b.Bytes(), nil
+}
+
+// deserializeRoute deserializes the mcRoute from the given io.Reader.
+func deserializeRoute(r io.Reader) (*mcRoute, error) {
+	var rt mcRoute
+	if err := channeldb.ReadElements(r, &rt.totalAmount); err != nil {
+		return nil, err
+	}
+
+	var pub []byte
+	if err := channeldb.ReadElements(r, &pub); err != nil {
+		return nil, err
+	}
+	copy(rt.sourcePubKey[:], pub)
+
+	var numHops uint32
+	if err := channeldb.ReadElements(r, &numHops); err != nil {
+		return nil, err
+	}
+
+	var hops []*mcHop
+	for i := uint32(0); i < numHops; i++ {
+		hop, err := deserializeHop(r)
+		if err != nil {
+			return nil, err
+		}
+		hops = append(hops, hop)
+	}
+	rt.hops = hops
+
+	return &rt, nil
+}
+
+// deserializeHop deserializes the mcHop from the given io.Reader.
+func deserializeHop(r io.Reader) (*mcHop, error) {
+	var h mcHop
+
+	var pub []byte
+	if err := channeldb.ReadElements(r, &pub); err != nil {
+		return nil, err
+	}
+	copy(h.pubKeyBytes[:], pub)
+
+	if err := channeldb.ReadElements(r,
+		&h.channelID, &h.amtToFwd, &h.hasBlindingPoint,
+		&h.hasCustomRecords,
+	); err != nil {
+		return nil, err
+	}
+
+	return &h, nil
+}
+
+// serializeRoute serializes a mcRoute and writes the resulting bytes to the
+// given io.Writer.
+func serializeRoute(w io.Writer, r *mcRoute) error {
+	err := channeldb.WriteElements(w, r.totalAmount, r.sourcePubKey[:])
+	if err != nil {
+		return err
+	}
+
+	if err := channeldb.WriteElements(w, uint32(len(r.hops))); err != nil {
+		return err
+	}
+
+	for _, h := range r.hops {
+		if err := serializeHop(w, h); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// serializeHop serializes a mcHop and writes the resulting bytes to the given
+// io.Writer.
+func serializeHop(w io.Writer, h *mcHop) error {
+	return channeldb.WriteElements(w,
+		h.pubKeyBytes[:],
+		h.channelID,
+		h.amtToFwd,
+		h.hasBlindingPoint,
+		h.hasCustomRecords,
+	)
 }
 
 // deserializeResult deserializes a payment result.
@@ -238,11 +329,11 @@ func deserializeResult(k, v []byte) (*paymentResult, error) {
 	}
 
 	// Read route.
-	route, err := channeldb.DeserializeRoute(r)
+	route, err := deserializeRoute(r)
 	if err != nil {
 		return nil, err
 	}
-	result.route = &route
+	result.route = route
 
 	// Read failure.
 	failureBytes, err := wire.ReadVarBytes(
@@ -265,14 +356,19 @@ func deserializeResult(k, v []byte) (*paymentResult, error) {
 
 // AddResult adds a new result to the db.
 func (b *missionControlStore) AddResult(rp *paymentResult) {
-	b.queueMx.Lock()
-	defer b.queueMx.Unlock()
+	b.queueCond.L.Lock()
 	b.queue.PushBack(rp)
+	b.queueCond.L.Unlock()
+
+	b.queueCond.Signal()
 }
 
 // stop stops the store ticker goroutine.
 func (b *missionControlStore) stop() {
 	close(b.done)
+
+	b.queueCond.Signal()
+
 	b.wg.Wait()
 }
 
@@ -281,19 +377,60 @@ func (b *missionControlStore) run() {
 	b.wg.Add(1)
 
 	go func() {
-		ticker := time.NewTicker(b.flushInterval)
-		defer ticker.Stop()
 		defer b.wg.Done()
 
-		for {
+		timer := time.NewTimer(b.flushInterval)
+
+		// Immediately stop the timer. It will be started once new
+		// items are added to the store. As the doc for time.Timer
+		// states, every call to Stop() done on a timer that is not
+		// known to have been fired needs to be checked and the timer's
+		// channel needs to be drained appropriately. This could happen
+		// if the flushInterval is very small (e.g. 1 nanosecond).
+		if !timer.Stop() {
 			select {
-			case <-ticker.C:
+			case <-timer.C:
+			case <-b.done:
+				log.Debugf("Stopping mission control store")
+			}
+		}
+
+		for {
+			// Wait for the queue to not be empty.
+			b.queueCond.L.Lock()
+			for b.queue.Front() == nil {
+				b.queueCond.Wait()
+
+				select {
+				case <-b.done:
+					b.queueCond.L.Unlock()
+
+					return
+				default:
+				}
+			}
+			b.queueCond.L.Unlock()
+
+			// Restart the timer.
+			timer.Reset(b.flushInterval)
+
+			select {
+			case <-timer.C:
 				if err := b.storeResults(); err != nil {
 					log.Errorf("Failed to update mission "+
 						"control store: %v", err)
 				}
 
 			case <-b.done:
+				// Release the timer's resources.
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					case <-b.done:
+						log.Debugf("Mission control " +
+							"store stopped")
+					}
+				}
 				return
 			}
 		}
@@ -302,32 +439,90 @@ func (b *missionControlStore) run() {
 
 // storeResults stores all accumulated results.
 func (b *missionControlStore) storeResults() error {
-	b.queueMx.Lock()
+	// We copy a reference to the queue and clear the original queue to be
+	// able to release the lock.
+	b.queueCond.L.Lock()
 	l := b.queue
+
+	if l.Len() == 0 {
+		b.queueCond.L.Unlock()
+
+		return nil
+	}
 	b.queue = list.New()
-	b.queueMx.Unlock()
+	b.queueCond.L.Unlock()
 
 	var (
-		keys    *list.List
-		keysMap map[string]struct{}
+		newKeys    map[string]struct{}
+		delKeys    []string
+		storeCount int
+		pruneCount int
 	)
 
-	err := kvdb.Update(b.db, func(tx kvdb.RwTx) error {
-		bucket := tx.ReadWriteBucket(resultsKey)
+	// Create a deduped list of new entries.
+	newKeys = make(map[string]struct{}, l.Len())
+	for e := l.Front(); e != nil; e = e.Next() {
+		pr, ok := e.Value.(*paymentResult)
+		if !ok {
+			return fmt.Errorf("wrong type %T (not *paymentResult)",
+				e.Value)
+		}
+		key := string(getResultKey(pr))
+		if _, ok := b.keysMap[key]; ok {
+			l.Remove(e)
+			continue
+		}
+		if _, ok := newKeys[key]; ok {
+			l.Remove(e)
+			continue
+		}
+		newKeys[key] = struct{}{}
+	}
 
+	// Create a list of entries to delete.
+	toDelete := b.keys.Len() + len(newKeys) - b.maxRecords
+	if b.maxRecords > 0 && toDelete > 0 {
+		delKeys = make([]string, 0, toDelete)
+
+		// Delete as many as needed from old keys.
+		for e := b.keys.Front(); len(delKeys) < toDelete && e != nil; {
+			key, ok := e.Value.(string)
+			if !ok {
+				return fmt.Errorf("wrong type %T (not string)",
+					e.Value)
+			}
+			delKeys = append(delKeys, key)
+			e = e.Next()
+		}
+
+		// If more deletions are needed, simply do not add from the
+		// list of new keys.
+		for e := l.Front(); len(delKeys) < toDelete && e != nil; {
+			toDelete--
+			pr, ok := e.Value.(*paymentResult)
+			if !ok {
+				return fmt.Errorf("wrong type %T (not "+
+					"*paymentResult )", e.Value)
+			}
+			key := string(getResultKey(pr))
+			delete(newKeys, key)
+			l.Remove(e)
+			e = l.Front()
+		}
+	}
+
+	err := b.db.update(func(bucket kvdb.RwBucket) error {
 		for e := l.Front(); e != nil; e = e.Next() {
-			pr := e.Value.(*paymentResult)
+			pr, ok := e.Value.(*paymentResult)
+			if !ok {
+				return fmt.Errorf("wrong type %T (not "+
+					"*paymentResult)", e.Value)
+			}
+
 			// Serialize result into key and value byte slices.
 			k, v, err := serializeResult(pr)
 			if err != nil {
 				return err
-			}
-
-			// The store is assumed to be idempotent. It could be
-			// that the same result is added twice and in that case
-			// we don't need to put the value again.
-			if _, ok := keysMap[string(k)]; ok {
-				continue
 			}
 
 			// Put into results bucket.
@@ -335,44 +530,43 @@ func (b *missionControlStore) storeResults() error {
 				return err
 			}
 
-			keys.PushBack(string(k))
-			keysMap[string(k)] = struct{}{}
+			storeCount++
 		}
 
 		// Prune oldest entries.
-		for {
-			if b.maxRecords == 0 || keys.Len() <= b.maxRecords {
-				break
-			}
-
-			front := keys.Front()
-			key := front.Value.(string)
-
+		for _, key := range delKeys {
 			if err := bucket.Delete([]byte(key)); err != nil {
 				return err
 			}
-
-			keys.Remove(front)
-			delete(keysMap, key)
+			pruneCount++
 		}
 
 		return nil
 	}, func() {
-		keys = list.New()
-		keys.PushBackList(b.keys)
-
-		keysMap = make(map[string]struct{})
-		for k := range b.keysMap {
-			keysMap[k] = struct{}{}
-		}
+		storeCount, pruneCount = 0, 0
 	})
 
 	if err != nil {
 		return err
 	}
 
-	b.keys = keys
-	b.keysMap = keysMap
+	log.Debugf("Stored mission control results: %d added, %d deleted",
+		storeCount, pruneCount)
+
+	// DB Update was successful, update the in-memory cache.
+	for _, key := range delKeys {
+		delete(b.keysMap, key)
+		b.keys.Remove(b.keys.Front())
+	}
+	for e := l.Front(); e != nil; e = e.Next() {
+		pr, ok := e.Value.(*paymentResult)
+		if !ok {
+			return fmt.Errorf("wrong type %T (not *paymentResult)",
+				e.Value)
+		}
+		key := string(getResultKey(pr))
+		b.keys.PushBack(key)
+	}
 
 	return nil
 }
@@ -388,7 +582,7 @@ func getResultKey(rp *paymentResult) []byte {
 	// chronologically.
 	byteOrder.PutUint64(keyBytes[:], uint64(rp.timeReply.UnixNano()))
 	byteOrder.PutUint64(keyBytes[8:], rp.id)
-	copy(keyBytes[16:], rp.route.SourcePubKey[:])
+	copy(keyBytes[16:], rp.route.sourcePubKey[:])
 
 	return keyBytes[:]
 }

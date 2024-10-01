@@ -5,11 +5,12 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btclog"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/netann"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
 
@@ -138,14 +139,16 @@ type PaymentSession interface {
 	// A noRouteError is returned if a non-critical error is encountered
 	// during path finding.
 	RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
-		activeShards, height uint32) (*route.Route, error)
+		activeShards, height uint32,
+		firstHopCustomRecords lnwire.CustomRecords) (*route.Route,
+		error)
 
 	// UpdateAdditionalEdge takes an additional channel edge policy
 	// (private channels) and applies the update from the message. Returns
 	// a boolean to indicate whether the update has been applied without
 	// error.
-	UpdateAdditionalEdge(msg *lnwire.ChannelUpdate, pubKey *btcec.PublicKey,
-		policy *models.CachedEdgePolicy) bool
+	UpdateAdditionalEdge(msg *lnwire.ChannelUpdate1,
+		pubKey *btcec.PublicKey, policy *models.CachedEdgePolicy) bool
 
 	// GetAdditionalEdgePolicy uses the public key and channel ID to query
 	// the ephemeral channel edge policy for additional edges. Returns a nil
@@ -156,16 +159,18 @@ type PaymentSession interface {
 
 // paymentSession is used during an HTLC routings session to prune the local
 // chain view in response to failures, and also report those failures back to
-// MissionControl. The snapshot copied for this session will only ever grow,
+// MissionController. The snapshot copied for this session will only ever grow,
 // and will now be pruned after a decay like the main view within mission
 // control. We do this as we want to avoid the case where we continually try a
 // bad edge or route multiple times in a session. This can lead to an infinite
 // loop if payment attempts take long enough. An additional set of edges can
 // also be provided to assist in reaching the payment's destination.
 type paymentSession struct {
+	selfNode route.Vertex
+
 	additionalEdges map[route.Vertex][]AdditionalEdge
 
-	getBandwidthHints func(routingGraph) (bandwidthHints, error)
+	getBandwidthHints func(Graph) (bandwidthHints, error)
 
 	payment *LightningPayment
 
@@ -173,13 +178,13 @@ type paymentSession struct {
 
 	pathFinder pathFinder
 
-	getRoutingGraph func() (routingGraph, func(), error)
+	graphSessFactory GraphSessionFactory
 
 	// pathFindingConfig defines global parameters that control the
 	// trade-off in path finding between fees and probability.
 	pathFindingConfig PathFindingConfig
 
-	missionControl MissionController
+	missionControl MissionControlQuerier
 
 	// minShardAmt is the amount beyond which we won't try to further split
 	// the payment if no route is found. If the maximum number of htlcs
@@ -192,25 +197,38 @@ type paymentSession struct {
 }
 
 // newPaymentSession instantiates a new payment session.
-func newPaymentSession(p *LightningPayment,
-	getBandwidthHints func(routingGraph) (bandwidthHints, error),
-	getRoutingGraph func() (routingGraph, func(), error),
-	missionControl MissionController, pathFindingConfig PathFindingConfig) (
-	*paymentSession, error) {
+func newPaymentSession(p *LightningPayment, selfNode route.Vertex,
+	getBandwidthHints func(Graph) (bandwidthHints, error),
+	graphSessFactory GraphSessionFactory,
+	missionControl MissionControlQuerier,
+	pathFindingConfig PathFindingConfig) (*paymentSession, error) {
 
 	edges, err := RouteHintsToEdges(p.RouteHints, p.Target)
 	if err != nil {
 		return nil, err
 	}
 
+	if p.BlindedPathSet != nil {
+		if len(edges) != 0 {
+			return nil, fmt.Errorf("cannot have both route hints " +
+				"and blinded path")
+		}
+
+		edges, err = p.BlindedPathSet.ToRouteHints()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	logPrefix := fmt.Sprintf("PaymentSession(%x):", p.Identifier())
 
 	return &paymentSession{
+		selfNode:          selfNode,
 		additionalEdges:   edges,
 		getBandwidthHints: getBandwidthHints,
 		payment:           p,
 		pathFinder:        findPath,
-		getRoutingGraph:   getRoutingGraph,
+		graphSessFactory:  graphSessFactory,
 		pathFindingConfig: pathFindingConfig,
 		missionControl:    missionControl,
 		minShardAmt:       DefaultShardMinAmt,
@@ -228,7 +246,8 @@ func newPaymentSession(p *LightningPayment,
 // NOTE: This function is safe for concurrent access.
 // NOTE: Part of the PaymentSession interface.
 func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
-	activeShards, height uint32) (*route.Route, error) {
+	activeShards, height uint32,
+	firstHopCustomRecords lnwire.CustomRecords) (*route.Route, error) {
 
 	if p.empty {
 		return nil, errEmptyPaySession
@@ -248,18 +267,19 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 
 	// Taking into account this prune view, we'll attempt to locate a path
 	// to our destination, respecting the recommendations from
-	// MissionControl.
+	// MissionController.
 	restrictions := &RestrictParams{
-		ProbabilitySource:  p.missionControl.GetProbability,
-		FeeLimit:           feeLimit,
-		OutgoingChannelIDs: p.payment.OutgoingChannelIDs,
-		LastHop:            p.payment.LastHop,
-		CltvLimit:          cltvLimit,
-		DestCustomRecords:  p.payment.DestCustomRecords,
-		DestFeatures:       p.payment.DestFeatures,
-		PaymentAddr:        p.payment.PaymentAddr,
-		Amp:                p.payment.amp,
-		Metadata:           p.payment.Metadata,
+		ProbabilitySource:     p.missionControl.GetProbability,
+		FeeLimit:              feeLimit,
+		OutgoingChannelIDs:    p.payment.OutgoingChannelIDs,
+		LastHop:               p.payment.LastHop,
+		CltvLimit:             cltvLimit,
+		DestCustomRecords:     p.payment.DestCustomRecords,
+		DestFeatures:          p.payment.DestFeatures,
+		PaymentAddr:           p.payment.PaymentAddr,
+		Amp:                   p.payment.amp,
+		Metadata:              p.payment.Metadata,
+		FirstHopCustomRecords: firstHopCustomRecords,
 	}
 
 	finalHtlcExpiry := int32(height) + int32(finalCltvDelta)
@@ -269,16 +289,16 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 	// client-side MTU that we'll attempt to respect at all times.
 	maxShardActive := p.payment.MaxShardAmt != nil
 	if maxShardActive && maxAmt > *p.payment.MaxShardAmt {
-		p.log.Debug("Clamping payment attempt from %v to %v due to "+
-			"max shard size of %v", maxAmt,
-			*p.payment.MaxShardAmt, maxAmt)
+		p.log.Debugf("Clamping payment attempt from %v to %v due to "+
+			"max shard size of %v", maxAmt, *p.payment.MaxShardAmt,
+			maxAmt)
 
 		maxAmt = *p.payment.MaxShardAmt
 	}
 
 	for {
-		// Get a routing graph.
-		routingGraph, cleanup, err := p.getRoutingGraph()
+		// Get a routing graph session.
+		graph, closeGraph, err := p.graphSessFactory.NewGraphSession()
 		if err != nil {
 			return nil, err
 		}
@@ -289,35 +309,45 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 		// don't have enough bandwidth to carry the payment. New
 		// bandwidth hints are queried for every new path finding
 		// attempt, because concurrent payments may change balances.
-		bandwidthHints, err := p.getBandwidthHints(routingGraph)
+		bandwidthHints, err := p.getBandwidthHints(graph)
 		if err != nil {
+			// Close routing graph session.
+			if graphErr := closeGraph(); graphErr != nil {
+				log.Errorf("could not close graph session: %v",
+					graphErr)
+			}
+
 			return nil, err
 		}
 
 		p.log.Debugf("pathfinding for amt=%v", maxAmt)
-
-		sourceVertex := routingGraph.sourceNode()
 
 		// Find a route for the current amount.
 		path, _, err := p.pathFinder(
 			&graphParams{
 				additionalEdges: p.additionalEdges,
 				bandwidthHints:  bandwidthHints,
-				graph:           routingGraph,
+				graph:           graph,
 			},
 			restrictions, &p.pathFindingConfig,
-			sourceVertex, p.payment.Target,
+			p.selfNode, p.selfNode, p.payment.Target,
 			maxAmt, p.payment.TimePref, finalHtlcExpiry,
 		)
 
-		// Close routing graph.
-		cleanup()
+		// Close routing graph session.
+		if err := closeGraph(); err != nil {
+			log.Errorf("could not close graph session: %v", err)
+		}
 
 		switch {
 		case err == errNoPathFound:
 			// Don't split if this is a legacy payment without mpp
-			// record.
-			if p.payment.PaymentAddr == nil {
+			// record. If it has a blinded path though, then we
+			// can split. Split payments to blinded paths won't have
+			// MPP records.
+			if p.payment.PaymentAddr.IsNone() &&
+				p.payment.BlindedPathSet == nil {
+
 				p.log.Debugf("not splitting because payment " +
 					"address is unspecified")
 
@@ -335,7 +365,8 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 				!destFeatures.HasFeature(lnwire.AMPOptional) {
 
 				p.log.Debug("not splitting because " +
-					"destination doesn't declare MPP or AMP")
+					"destination doesn't declare MPP or " +
+					"AMP")
 
 				return nil, errNoPathFound
 			}
@@ -384,7 +415,7 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 		// this into a route by applying the time-lock and fee
 		// requirements.
 		route, err := newRoute(
-			sourceVertex, path, height,
+			p.selfNode, path, height,
 			finalHopParams{
 				amt:         maxAmt,
 				totalAmt:    p.payment.Amount,
@@ -392,7 +423,7 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 				records:     p.payment.DestCustomRecords,
 				paymentAddr: p.payment.PaymentAddr,
 				metadata:    p.payment.Metadata,
-			}, nil,
+			}, p.payment.BlindedPathSet,
 		)
 		if err != nil {
 			return nil, err
@@ -406,11 +437,11 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 // validates the message signature and checks it's up to date, then applies the
 // updates to the supplied policy. It returns a boolean to indicate whether
 // there's an error when applying the updates.
-func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate,
+func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate1,
 	pubKey *btcec.PublicKey, policy *models.CachedEdgePolicy) bool {
 
 	// Validate the message signature.
-	if err := VerifyChannelUpdateSignature(msg, pubKey); err != nil {
+	if err := netann.VerifyChannelUpdateSignature(msg, pubKey); err != nil {
 		log.Errorf(
 			"Unable to validate channel update signature: %v", err,
 		)
@@ -423,7 +454,7 @@ func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate,
 	policy.FeeProportionalMillionths = lnwire.MilliSatoshi(msg.FeeRate)
 
 	log.Debugf("New private channel update applied: %v",
-		newLogClosure(func() string { return spew.Sdump(msg) }))
+		lnutils.SpewLogClosure(msg))
 
 	return true
 }

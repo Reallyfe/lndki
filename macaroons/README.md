@@ -39,7 +39,7 @@ With the root key set up, `lnd` continues with creating three macaroon files:
   the name might suggest it. The permission `offchain` is needed to pay an
   invoice which is currently only granted in the admin macaroon.
 * `readonly.macaroon`: Grants read-only access to all gRPC commands. Could be
-  given to  a monitoring application for example.
+  given to a monitoring application for example.
 * `admin.macaroon`: Grants full read and write access to all gRPC commands.
   This is used by the `lncli` client.
 
@@ -113,6 +113,23 @@ $  lncli bakemacaroon uri:/lnrpc.Lightning/GetInfo uri:/verrpc.Versioner/GetVers
 The macaroon created by this call would only be allowed to call the `GetInfo` and
 `GetVersion` methods instead of all methods that have similar permissions (like
 `info:read` for example).
+
+If you need a macaroon file with rights similar to `admin.macaroon` for a
+custom use case, you can create one as shown in the following example.
+Note that a macaroon created in this way will have extensive rights, allowing
+it to create macaroons with more permissions than the original one.
+```shell
+$  lncli bakemacaroon --save_to lnbits.macaroon \
+   address:read address:write \
+   info:read info:write \
+   invoices:read invoices:write \
+   macaroon:generate macaroon:read macaroon:write \
+   message:read message:write \
+   offchain:read offchain:write \
+   onchain:read onchain:write \
+   peers:read peers:write \
+   signer:generate signer:read
+```
 
 A full list of available entity/action pairs and RPC method URIs can be queried
 by using the `lncli listpermissions` command.

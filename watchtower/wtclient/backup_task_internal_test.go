@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -136,6 +137,7 @@ func genTaskTest(
 		if chanType.IsTaproot() {
 			scriptTree, _ := input.NewLocalCommitScriptTree(
 				csvDelay, toLocalPK, revPK,
+				fn.None[txscript.TapLeaf](),
 			)
 
 			pkScript, _ := input.PayToTaprootScript(
@@ -189,7 +191,7 @@ func genTaskTest(
 
 		if chanType.IsTaproot() {
 			scriptTree, _ := input.NewRemoteCommitScriptTree(
-				toRemotePK,
+				toRemotePK, fn.None[txscript.TapLeaf](),
 			)
 
 			pkScript, _ := input.PayToTaprootScript(
@@ -580,10 +582,10 @@ func testBackupTask(t *testing.T, test backupTaskTest) {
 	// task's inputs() method.
 	expInputs := make(map[wire.OutPoint]input.Input)
 	if task.toLocalInput != nil {
-		expInputs[*task.toLocalInput.OutPoint()] = task.toLocalInput
+		expInputs[task.toLocalInput.OutPoint()] = task.toLocalInput
 	}
 	if task.toRemoteInput != nil {
-		expInputs[*task.toRemoteInput.OutPoint()] = task.toRemoteInput
+		expInputs[task.toRemoteInput.OutPoint()] = task.toRemoteInput
 	}
 
 	// Assert that the inputs method returns the correct slice of

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/stretchr/testify/require"
@@ -106,17 +107,20 @@ func TestSparseConfFeeSource(t *testing.T) {
 		2: 42,
 		3: 54321,
 	}
-	testJSON := map[string]map[uint32]uint32{
-		"fee_by_block_target": testFees,
+	testMinRelayFee := SatPerKVByte(1000)
+	testResp := WebAPIResponse{
+		MinRelayFeerate:  testMinRelayFee,
+		FeeByBlockTarget: testFees,
 	}
-	jsonResp, err := json.Marshal(testJSON)
+
+	jsonResp, err := json.Marshal(testResp)
 	require.NoError(t, err, "unable to marshal JSON API response")
 	reader := bytes.NewReader(jsonResp)
 
 	// Finally, ensure the expected map is returned without error.
-	fees, err := feeSource.parseResponse(reader)
+	resp, err := feeSource.parseResponse(reader)
 	require.NoError(t, err, "unable to parse API response")
-	require.Equal(t, testFees, fees, "unexpected fee map returned")
+	require.Equal(t, testResp, resp, "unexpected resp returned")
 
 	// Test parsing an improperly formatted JSON API response.
 	badFees := map[string]uint32{"hi": 12345, "hello": 42, "satoshi": 54321}
@@ -128,6 +132,45 @@ func TestSparseConfFeeSource(t *testing.T) {
 	// Finally, ensure the improperly formatted fees error.
 	_, err = feeSource.parseResponse(reader)
 	require.Error(t, err, "expected error when parsing bad JSON")
+}
+
+// TestFeeSourceCompatibility checks that when a fee source doesn't return a
+// `min_relay_feerate` field in its response, the floor feerate is used.
+//
+// NOTE: Field `min_relay_feerate` was added in v0.18.3.
+func TestFeeSourceCompatibility(t *testing.T) {
+	t.Parallel()
+
+	// Test that GenQueryURL returns the URL as is.
+	url := "test"
+	feeSource := SparseConfFeeSource{URL: url}
+
+	// Test parsing a properly formatted JSON API response.
+	//
+	// Create the resp without the `min_relay_feerate` field.
+	testFees := map[uint32]uint32{
+		1: 12345,
+	}
+	testResp := struct {
+		// FeeByBlockTarget is a map of confirmation targets to sat/kvb
+		// fees.
+		FeeByBlockTarget map[uint32]uint32 `json:"fee_by_block_target"`
+	}{
+		FeeByBlockTarget: testFees,
+	}
+
+	jsonResp, err := json.Marshal(testResp)
+	require.NoError(t, err, "unable to marshal JSON API response")
+	reader := bytes.NewReader(jsonResp)
+
+	// Ensure the expected map is returned without error.
+	resp, err := feeSource.parseResponse(reader)
+	require.NoError(t, err, "unable to parse API response")
+	require.Equal(t, testResp.FeeByBlockTarget, resp.FeeByBlockTarget,
+		"unexpected resp returned")
+
+	// Expect the floor feerate to be used.
+	require.Equal(t, FeePerKwFloor.FeePerKVByte(), resp.MinRelayFeerate)
 }
 
 // TestWebAPIFeeEstimator checks that the WebAPIFeeEstimator returns fee rates
@@ -142,6 +185,9 @@ func TestWebAPIFeeEstimator(t *testing.T) {
 		// Fee rates are in sat/kb.
 		minFeeRate uint32 = 2000 // 500 sat/kw
 		maxFeeRate uint32 = 4000 // 1000 sat/kw
+
+		minFeeUpdateTimeout = 5 * time.Minute
+		maxFeeUpdateTimeout = 20 * time.Minute
 	)
 
 	testCases := []struct {
@@ -190,23 +236,28 @@ func TestWebAPIFeeEstimator(t *testing.T) {
 	// This will create a `feeByBlockTarget` map with the following values,
 	// - 2: 4000 sat/kb
 	// - 6: 2000 sat/kb.
-	feeRateResp := map[uint32]uint32{
+	feeRates := map[uint32]uint32{
 		minTarget: maxFeeRate,
 		maxTarget: minFeeRate,
+	}
+	resp := WebAPIResponse{
+		FeeByBlockTarget: feeRates,
 	}
 
 	// Create a mock fee source and mock its returned map.
 	feeSource := &mockFeeSource{}
-	feeSource.On("GetFeeMap").Return(feeRateResp, nil)
+	feeSource.On("GetFeeInfo").Return(resp, nil)
 
-	estimator := NewWebAPIEstimator(feeSource, false)
+	estimator, _ := NewWebAPIEstimator(
+		feeSource, false, minFeeUpdateTimeout, maxFeeUpdateTimeout,
+	)
 
-	// Test that requesting a fee when no fees have been cached won't fail.
+	// Test that when the estimator is not started, an error is returned.
 	feeRate, err := estimator.EstimateFeePerKW(5)
-	require.NoErrorf(t, err, "expected no error")
-	require.Equalf(t, FeePerKwFloor, feeRate, "expected fee rate floor "+
-		"returned when no cached fee rate found")
+	require.Error(t, err, "expected an error")
+	require.Zero(t, feeRate, "expected zero fee rate")
 
+	// Start the estimator.
 	require.NoError(t, estimator.Start(), "unable to start fee estimator")
 
 	for _, tc := range testCases {
@@ -228,7 +279,7 @@ func TestWebAPIFeeEstimator(t *testing.T) {
 
 			exp := SatPerKVByte(tc.expectedFeeRate).FeePerKWeight()
 			require.Equalf(t, exp, est, "target %v failed, fee "+
-				"map is %v", tc.target, feeRateResp)
+				"map is %v", tc.target, feeRate)
 		})
 	}
 
@@ -247,10 +298,15 @@ func TestGetCachedFee(t *testing.T) {
 
 		minFeeRate uint32 = 100
 		maxFeeRate uint32 = 1000
+
+		minFeeUpdateTimeout = 5 * time.Minute
+		maxFeeUpdateTimeout = 20 * time.Minute
 	)
 
 	// Create a dummy estimator without WebAPIFeeSource.
-	estimator := NewWebAPIEstimator(nil, false)
+	estimator, _ := NewWebAPIEstimator(
+		nil, false, minFeeUpdateTimeout, maxFeeUpdateTimeout,
+	)
 
 	// When the cache is empty, an error should be returned.
 	cachedFee, err := estimator.getCachedFee(minTarget)
@@ -314,4 +370,39 @@ func TestGetCachedFee(t *testing.T) {
 			require.Equal(t, tc.expectedFee, cachedFee)
 		})
 	}
+}
+
+func TestRandomFeeUpdateTimeout(t *testing.T) {
+	t.Parallel()
+
+	var (
+		minFeeUpdateTimeout = 1 * time.Minute
+		maxFeeUpdateTimeout = 2 * time.Minute
+	)
+
+	estimator, _ := NewWebAPIEstimator(
+		nil, false, minFeeUpdateTimeout, maxFeeUpdateTimeout,
+	)
+
+	for i := 0; i < 1000; i++ {
+		timeout := estimator.randomFeeUpdateTimeout()
+
+		require.GreaterOrEqual(t, timeout, minFeeUpdateTimeout)
+		require.LessOrEqual(t, timeout, maxFeeUpdateTimeout)
+	}
+}
+
+func TestInvalidFeeUpdateTimeout(t *testing.T) {
+	t.Parallel()
+
+	var (
+		minFeeUpdateTimeout = 2 * time.Minute
+		maxFeeUpdateTimeout = 1 * time.Minute
+	)
+
+	_, err := NewWebAPIEstimator(
+		nil, false, minFeeUpdateTimeout, maxFeeUpdateTimeout,
+	)
+	require.Error(t, err, "NewWebAPIEstimator should return an error "+
+		"when minFeeUpdateTimeout > maxFeeUpdateTimeout")
 }

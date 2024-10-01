@@ -13,15 +13,10 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/sweep"
-)
-
-const (
-	// commitOutputConfTarget is the default confirmation target we'll use
-	// for sweeps of commit outputs that belong to us.
-	commitOutputConfTarget = 6
 )
 
 // commitSweepResolver is a resolver that will attempt to sweep the commitment
@@ -29,6 +24,11 @@ const (
 // version of the commitment transaction. We can sweep this output immediately,
 // as it doesn't have a time-lock delay.
 type commitSweepResolver struct {
+	// localChanCfg is used to provide the resolver with the keys required
+	// to identify whether the commitment transaction was broadcast by the
+	// local or remote party.
+	localChanCfg channeldb.ChannelConfig
+
 	// commitResolution contains all data required to successfully sweep
 	// this HTLC on-chain.
 	commitResolution lnwallet.CommitOutputResolution
@@ -189,7 +189,9 @@ func (c *commitSweepResolver) getCommitTxConfHeight() (uint32, error) {
 // returned.
 //
 // NOTE: This function MUST be run as a goroutine.
-func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
+//
+//nolint:funlen
+func (c *commitSweepResolver) Resolve(_ bool) (ContractResolver, error) {
 	// If we're already resolved, then we can exit early.
 	if c.resolved {
 		return nil, nil
@@ -255,18 +257,26 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 
 		signDesc = c.commitResolution.SelfOutputSignDesc
 	)
+
 	switch {
 	// For taproot channels, we'll know if this is the local commit based
-	// on the witness script. For local channels, the witness script has an
-	// OP_DROP value.
-	//
-	// TODO(roasbeef): revisit this after the script changes
-	//  * otherwise need to base off the key in script or the CSV value
-	//  (script num encode)
+	// on the timelock value. For remote commitment transactions, the
+	// witness script has a timelock of 1.
 	case c.chanType.IsTaproot():
-		scriptLen := len(signDesc.WitnessScript)
-		isLocalCommitTx = signDesc.WitnessScript[scriptLen-1] ==
-			txscript.OP_DROP
+		delayKey := c.localChanCfg.DelayBasePoint.PubKey
+		nonDelayKey := c.localChanCfg.PaymentBasePoint.PubKey
+
+		signKey := c.commitResolution.SelfOutputSignDesc.KeyDesc.PubKey
+
+		// If the key in the script is neither of these, we shouldn't
+		// proceed. This should be impossible.
+		if !signKey.IsEqual(delayKey) && !signKey.IsEqual(nonDelayKey) {
+			return nil, fmt.Errorf("unknown sign key %v", signKey)
+		}
+
+		// The commitment transaction is ours iff the signing key is
+		// the delay key.
+		isLocalCommitTx = signKey.IsEqual(delayKey)
 
 	// The output is on our local commitment if the script starts with
 	// OP_IF for the revocation clause. On the remote commitment it will
@@ -347,12 +357,23 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 	// TODO(roasbeef): instead of ading ctrl block to the sign desc, make
 	// new input type, have sweeper set it?
 
-	// With our input constructed, we'll now offer it to the
-	// sweeper.
-	c.log.Infof("sweeping commit output")
+	// Calculate the budget for the sweeping this input.
+	budget := calculateBudget(
+		btcutil.Amount(inp.SignDesc().Output.Value),
+		c.Budget.ToLocalRatio, c.Budget.ToLocal,
+	)
+	c.log.Infof("Sweeping commit output using budget=%v", budget)
 
-	feePref := sweep.FeePreference{ConfTarget: commitOutputConfTarget}
-	resultChan, err := c.Sweeper.SweepInput(inp, sweep.Params{Fee: feePref})
+	// With our input constructed, we'll now offer it to the sweeper.
+	resultChan, err := c.Sweeper.SweepInput(
+		inp, sweep.Params{
+			Budget: budget,
+
+			// Specify a nil deadline here as there's no time
+			// pressure.
+			DeadlineHeight: fn.None[int32](),
+		},
+	)
 	if err != nil {
 		c.log.Errorf("unable to sweep input: %v", err)
 
@@ -438,6 +459,7 @@ func (c *commitSweepResolver) SupplementState(state *channeldb.OpenChannel) {
 	if state.ChanType.HasLeaseExpiration() {
 		c.leaseExpiry = state.ThawHeight
 	}
+	c.localChanCfg = state.LocalChanCfg
 	c.channelInitiator = state.IsInitiator
 	c.chanType = state.ChanType
 }

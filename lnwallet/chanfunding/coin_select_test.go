@@ -50,7 +50,7 @@ func fundingFee(feeRate chainfee.SatPerKWeight, numInput int, // nolint:unparam
 		weightEstimate.AddP2TROutput()
 	}
 
-	totalWeight := int64(weightEstimate.Weight())
+	totalWeight := weightEstimate.Weight()
 	return feeRate.FeeForWeight(totalWeight)
 }
 
@@ -874,7 +874,7 @@ func TestCoinSelectUpToAmount(t *testing.T) {
 				defaultChanFundingChangeType,
 			)
 			if len(test.expectErr) == 0 && err != nil {
-				t.Fatalf(err.Error())
+				t.Fatal(err.Error())
 			}
 			if changeAmt != test.expectedChange {
 				t.Fatalf("expected %v change amt, got %v",

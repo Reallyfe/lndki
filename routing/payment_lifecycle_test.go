@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lntest/wait"
@@ -27,7 +29,11 @@ func createTestPaymentLifecycle() *paymentLifecycle {
 	paymentHash := lntypes.Hash{1, 2, 3}
 	quitChan := make(chan struct{})
 	rt := &ChannelRouter{
-		cfg:  &Config{},
+		cfg: &Config{
+			TrafficShaper: fn.Some[TlvTrafficShaper](
+				&mockTrafficShaper{},
+			),
+		},
 		quit: quitChan,
 	}
 
@@ -77,6 +83,9 @@ func newTestPaymentLifecycle(t *testing.T) (*paymentLifecycle, *mockers) {
 			Payer:          mockPayer,
 			Clock:          mockClock,
 			MissionControl: mockMissionControl,
+			TrafficShaper: fn.Some[TlvTrafficShaper](
+				&mockTrafficShaper{},
+			),
 		},
 		quit: quitChan,
 	}
@@ -88,7 +97,7 @@ func newTestPaymentLifecycle(t *testing.T) (*paymentLifecycle, *mockers) {
 	// Create a test payment lifecycle with no fee limit and no timeout.
 	p := newPaymentLifecycle(
 		rt, noFeeLimit, paymentHash, mockPaymentSession,
-		mockShardTracker, 0, 0,
+		mockShardTracker, 0, nil,
 	)
 
 	// Create a mock payment which is returned from mockControlTower.
@@ -151,9 +160,9 @@ type resumePaymentResult struct {
 	err      error
 }
 
-// sendPaymentAndAssertFailed calls `resumePayment` and asserts that an error
-// is returned.
-func sendPaymentAndAssertFailed(t *testing.T,
+// sendPaymentAndAssertError calls `resumePayment` and asserts that an error is
+// returned.
+func sendPaymentAndAssertError(t *testing.T, ctx context.Context,
 	p *paymentLifecycle, errExpected error) {
 
 	resultChan := make(chan *resumePaymentResult, 1)
@@ -161,7 +170,7 @@ func sendPaymentAndAssertFailed(t *testing.T,
 	// We now make a call to `resumePayment` and expect it to return the
 	// error.
 	go func() {
-		preimage, _, err := p.resumePayment()
+		preimage, _, err := p.resumePayment(ctx)
 		resultChan <- &resumePaymentResult{
 			preimage: preimage,
 			err:      err,
@@ -189,7 +198,7 @@ func sendPaymentAndAssertSucceeded(t *testing.T,
 	// We now make a call to `resumePayment` and expect it to return the
 	// preimage.
 	go func() {
-		preimage, _, err := p.resumePayment()
+		preimage, _, err := p.resumePayment(context.Background())
 		resultChan <- &resumePaymentResult{
 			preimage: preimage,
 			err:      err,
@@ -278,6 +287,10 @@ func makeAttemptInfo(t *testing.T, amt int) channeldb.HTLCAttemptInfo {
 func TestCheckTimeoutTimedOut(t *testing.T) {
 	t.Parallel()
 
+	deadline := time.Now().Add(time.Nanosecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
 	p := createTestPaymentLifecycle()
 
 	// Mock the control tower's `FailPayment` method.
@@ -288,14 +301,11 @@ func TestCheckTimeoutTimedOut(t *testing.T) {
 	// Mount the mocked control tower.
 	p.router.cfg.Control = ct
 
-	// Make the timeout happens instantly.
-	p.timeoutChan = time.After(1 * time.Nanosecond)
-
 	// Sleep one millisecond to make sure it timed out.
 	time.Sleep(1 * time.Millisecond)
 
 	// Call the function and expect no error.
-	err := p.checkTimeout()
+	err := p.checkContext(ctx)
 	require.NoError(t, err)
 
 	// Assert that `FailPayment` is called as expected.
@@ -313,13 +323,15 @@ func TestCheckTimeoutTimedOut(t *testing.T) {
 	p.router.cfg.Control = ct
 
 	// Make the timeout happens instantly.
-	p.timeoutChan = time.After(1 * time.Nanosecond)
+	deadline = time.Now().Add(time.Nanosecond)
+	ctx, cancel = context.WithDeadline(context.Background(), deadline)
+	defer cancel()
 
 	// Sleep one millisecond to make sure it timed out.
 	time.Sleep(1 * time.Millisecond)
 
 	// Call the function and expect an error.
-	err = p.checkTimeout()
+	err = p.checkContext(ctx)
 	require.ErrorIs(t, err, errDummy)
 
 	// Assert that `FailPayment` is called as expected.
@@ -331,10 +343,13 @@ func TestCheckTimeoutTimedOut(t *testing.T) {
 func TestCheckTimeoutOnRouterQuit(t *testing.T) {
 	t.Parallel()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	p := createTestPaymentLifecycle()
 
 	close(p.router.quit)
-	err := p.checkTimeout()
+	err := p.checkContext(ctx)
 	require.ErrorIs(t, err, ErrRouterShuttingDown)
 }
 
@@ -365,6 +380,7 @@ func TestRequestRouteSucceed(t *testing.T) {
 	// Mock the paySession's `RequestRoute` method to return no error.
 	paySession.On("RequestRoute",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything,
 	).Return(dummyRoute, nil)
 
 	result, err := p.requestRoute(ps)
@@ -401,6 +417,7 @@ func TestRequestRouteHandleCriticalErr(t *testing.T) {
 	// Mock the paySession's `RequestRoute` method to return an error.
 	paySession.On("RequestRoute",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything,
 	).Return(nil, errDummy)
 
 	result, err := p.requestRoute(ps)
@@ -435,6 +452,7 @@ func TestRequestRouteHandleNoRouteErr(t *testing.T) {
 	// type.
 	m.paySession.On("RequestRoute",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything,
 	).Return(nil, errNoTlvPayload)
 
 	// The payment should be failed with reason no route.
@@ -482,6 +500,7 @@ func TestRequestRouteFailPaymentError(t *testing.T) {
 	// Mock the paySession's `RequestRoute` method to return an error.
 	paySession.On("RequestRoute",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything,
 	).Return(nil, errNoTlvPayload)
 
 	result, err := p.requestRoute(ps)
@@ -627,7 +646,7 @@ func TestResumePaymentFailOnFetchPayment(t *testing.T) {
 	m.control.On("FetchPayment", p.identifier).Return(nil, errDummy)
 
 	// Send the payment and assert it failed.
-	sendPaymentAndAssertFailed(t, p, errDummy)
+	sendPaymentAndAssertError(t, context.Background(), p, errDummy)
 
 	// Expected collectResultAsync to not be called.
 	require.Zero(t, m.collectResultsCount)
@@ -656,14 +675,15 @@ func TestResumePaymentFailOnTimeout(t *testing.T) {
 	}
 	m.payment.On("GetState").Return(ps).Once()
 
-	// NOTE: GetStatus is only used to populate the logs which is
-	// not critical so we loosen the checks on how many times it's
-	// been called.
+	// NOTE: GetStatus is only used to populate the logs which is not
+	// critical, so we loosen the checks on how many times it's been called.
 	m.payment.On("GetStatus").Return(channeldb.StatusInFlight)
 
 	// 3. make the timeout happens instantly and sleep one millisecond to
 	// make sure it timed out.
-	p.timeoutChan = time.After(1 * time.Nanosecond)
+	deadline := time.Now().Add(time.Nanosecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
 	time.Sleep(1 * time.Millisecond)
 
 	// 4. the payment should be failed with reason timeout.
@@ -683,7 +703,7 @@ func TestResumePaymentFailOnTimeout(t *testing.T) {
 	m.payment.On("TerminalInfo").Return(nil, &reason)
 
 	// Send the payment and assert it failed with the timeout reason.
-	sendPaymentAndAssertFailed(t, p, reason)
+	sendPaymentAndAssertError(t, ctx, p, reason)
 
 	// Expected collectResultAsync to not be called.
 	require.Zero(t, m.collectResultsCount)
@@ -721,7 +741,65 @@ func TestResumePaymentFailOnTimeoutErr(t *testing.T) {
 	close(p.router.quit)
 
 	// Send the payment and assert it failed when router is shutting down.
-	sendPaymentAndAssertFailed(t, p, ErrRouterShuttingDown)
+	sendPaymentAndAssertError(
+		t, context.Background(), p, ErrRouterShuttingDown,
+	)
+
+	// Expected collectResultAsync to not be called.
+	require.Zero(t, m.collectResultsCount)
+}
+
+// TestResumePaymentFailContextCancel checks that the lifecycle fails when the
+// context is canceled.
+//
+// NOTE: No parallel test because it overwrites global variables.
+//
+//nolint:paralleltest
+func TestResumePaymentFailContextCancel(t *testing.T) {
+	// Create a test paymentLifecycle with the initial two calls mocked.
+	p, m := setupTestPaymentLifecycle(t)
+
+	// Create the cancelable payment context.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	paymentAmt := lnwire.MilliSatoshi(10000)
+
+	// We now enter the payment lifecycle loop.
+	//
+	// 1. calls `FetchPayment` and return the payment.
+	m.control.On("FetchPayment", p.identifier).Return(m.payment, nil).Once()
+
+	// 2. calls `GetState` and return the state.
+	ps := &channeldb.MPPaymentState{
+		RemainingAmt: paymentAmt,
+	}
+	m.payment.On("GetState").Return(ps).Once()
+
+	// NOTE: GetStatus is only used to populate the logs which is not
+	// critical, so we loosen the checks on how many times it's been called.
+	m.payment.On("GetStatus").Return(channeldb.StatusInFlight)
+
+	// 3. Cancel the context and skip the FailPayment error to trigger the
+	// context cancellation of the payment.
+	cancel()
+
+	m.control.On(
+		"FailPayment", p.identifier, channeldb.FailureReasonCanceled,
+	).Return(nil).Once()
+
+	// 4. decideNextStep now returns stepExit.
+	m.payment.On("AllowMoreAttempts").Return(false, nil).Once().
+		On("NeedWaitAttempts").Return(false, nil).Once()
+
+	// 5. Control tower deletes failed attempts.
+	m.control.On("DeleteFailedAttempts", p.identifier).Return(nil).Once()
+
+	// 6. We will observe FailureReasonError if the context was cancelled.
+	reason := channeldb.FailureReasonError
+	m.payment.On("TerminalInfo").Return(nil, &reason)
+
+	// Send the payment and assert it failed with the timeout reason.
+	sendPaymentAndAssertError(t, ctx, p, reason)
 
 	// Expected collectResultAsync to not be called.
 	require.Zero(t, m.collectResultsCount)
@@ -759,7 +837,7 @@ func TestResumePaymentFailOnStepErr(t *testing.T) {
 	m.payment.On("AllowMoreAttempts").Return(false, errDummy).Once()
 
 	// Send the payment and assert it failed.
-	sendPaymentAndAssertFailed(t, p, errDummy)
+	sendPaymentAndAssertError(t, context.Background(), p, errDummy)
 
 	// Expected collectResultAsync to not be called.
 	require.Zero(t, m.collectResultsCount)
@@ -799,11 +877,11 @@ func TestResumePaymentFailOnRequestRouteErr(t *testing.T) {
 	// 4. mock requestRoute to return an error.
 	m.paySession.On("RequestRoute",
 		paymentAmt, p.feeLimit, uint32(ps.NumAttemptsInFlight),
-		uint32(p.currentHeight),
+		uint32(p.currentHeight), mock.Anything,
 	).Return(nil, errDummy).Once()
 
 	// Send the payment and assert it failed.
-	sendPaymentAndAssertFailed(t, p, errDummy)
+	sendPaymentAndAssertError(t, context.Background(), p, errDummy)
 
 	// Expected collectResultAsync to not be called.
 	require.Zero(t, m.collectResultsCount)
@@ -845,7 +923,7 @@ func TestResumePaymentFailOnRegisterAttemptErr(t *testing.T) {
 	// 4. mock requestRoute to return an route.
 	m.paySession.On("RequestRoute",
 		paymentAmt, p.feeLimit, uint32(ps.NumAttemptsInFlight),
-		uint32(p.currentHeight),
+		uint32(p.currentHeight), mock.Anything,
 	).Return(rt, nil).Once()
 
 	// 5. mock shardTracker used in `createNewPaymentAttempt` to return an
@@ -863,7 +941,7 @@ func TestResumePaymentFailOnRegisterAttemptErr(t *testing.T) {
 	).Return(nil, errDummy).Once()
 
 	// Send the payment and assert it failed.
-	sendPaymentAndAssertFailed(t, p, errDummy)
+	sendPaymentAndAssertError(t, context.Background(), p, errDummy)
 
 	// Expected collectResultAsync to not be called.
 	require.Zero(t, m.collectResultsCount)
@@ -905,7 +983,7 @@ func TestResumePaymentFailOnSendAttemptErr(t *testing.T) {
 	// 4. mock requestRoute to return an route.
 	m.paySession.On("RequestRoute",
 		paymentAmt, p.feeLimit, uint32(ps.NumAttemptsInFlight),
-		uint32(p.currentHeight),
+		uint32(p.currentHeight), mock.Anything,
 	).Return(rt, nil).Once()
 
 	// 5. mock `registerAttempt` to return an attempt.
@@ -955,7 +1033,7 @@ func TestResumePaymentFailOnSendAttemptErr(t *testing.T) {
 	).Return(nil, errDummy).Once()
 
 	// Send the payment and assert it failed.
-	sendPaymentAndAssertFailed(t, p, errDummy)
+	sendPaymentAndAssertError(t, context.Background(), p, errDummy)
 
 	// Expected collectResultAsync to not be called.
 	require.Zero(t, m.collectResultsCount)
@@ -997,7 +1075,7 @@ func TestResumePaymentSuccess(t *testing.T) {
 	// 1.4. mock requestRoute to return an route.
 	m.paySession.On("RequestRoute",
 		paymentAmt, p.feeLimit, uint32(ps.NumAttemptsInFlight),
-		uint32(p.currentHeight),
+		uint32(p.currentHeight), mock.Anything,
 	).Return(rt, nil).Once()
 
 	// 1.5. mock `registerAttempt` to return an attempt.
@@ -1098,7 +1176,7 @@ func TestResumePaymentSuccessWithTwoAttempts(t *testing.T) {
 	// 1.4. mock requestRoute to return an route.
 	m.paySession.On("RequestRoute",
 		paymentAmt, p.feeLimit, uint32(ps.NumAttemptsInFlight),
-		uint32(p.currentHeight),
+		uint32(p.currentHeight), mock.Anything,
 	).Return(rt, nil).Once()
 
 	// Create two attempt IDs here.
@@ -1160,7 +1238,7 @@ func TestResumePaymentSuccessWithTwoAttempts(t *testing.T) {
 	// 2.4. mock requestRoute to return an route.
 	m.paySession.On("RequestRoute",
 		paymentAmt/2, p.feeLimit, uint32(ps.NumAttemptsInFlight),
-		uint32(p.currentHeight),
+		uint32(p.currentHeight), mock.Anything,
 	).Return(rt, nil).Once()
 
 	// 2.5. mock `registerAttempt` to return an attempt.

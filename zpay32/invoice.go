@@ -8,6 +8,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -76,6 +77,10 @@ const (
 	// probing the recipient.
 	fieldTypeS = 16
 
+	// fieldTypeB contains blinded payment path information. This field may
+	// be repeated to include multiple blinded payment paths in the invoice.
+	fieldTypeB = 20
+
 	// maxInvoiceLength is the maximum total length an invoice can have.
 	// This is chosen to be the maximum number of bytes that can fit into a
 	// single QR code: https://en.wikipedia.org/wiki/QR_code#Storage
@@ -132,7 +137,7 @@ type Invoice struct {
 
 	// PaymentAddr is the payment address to be used by payments to prevent
 	// probing of the destination.
-	PaymentAddr *[32]byte
+	PaymentAddr fn.Option[[32]byte]
 
 	// Destination is the public key of the target node. This will always
 	// be set after decoding, and can optionally be set before encoding to
@@ -152,6 +157,10 @@ type Invoice struct {
 	// This field is un-exported and can only be read by the
 	// MinFinalCLTVExpiry() method. By forcing callers to read via this
 	// method, we can easily enforce the default if not specified.
+	//
+	// NOTE: this field is ignored in the case that the invoice contains
+	// blinded paths since then the final minimum cltv expiry delta is
+	// expected to be included in the route's accumulated CLTV delta value.
 	minFinalCLTVExpiry *uint64
 
 	// Description is a short description of the purpose of this invoice.
@@ -180,8 +189,16 @@ type Invoice struct {
 	// hint can be individually used to reach the destination. These usually
 	// represent private routes.
 	//
-	// NOTE: This is optional.
+	// NOTE: This is optional and should not be set at the same time as
+	// BlindedPaymentPaths.
 	RouteHints [][]HopHint
+
+	// BlindedPaymentPaths is a set of blinded payment paths that can be
+	// used to find the payment receiver.
+	//
+	// NOTE: This is optional and should not be set at the same time as
+	// RouteHints.
+	BlindedPaymentPaths []*BlindedPaymentPath
 
 	// Features represents an optional field used to signal optional or
 	// required support for features by the receiver.
@@ -263,6 +280,15 @@ func RouteHint(routeHint []HopHint) func(*Invoice) {
 	}
 }
 
+// WithBlindedPaymentPath is a functional option that allows a caller of
+// NewInvoice to attach a blinded payment path to the invoice. The option can
+// be used multiple times to attach multiple paths.
+func WithBlindedPaymentPath(p *BlindedPaymentPath) func(*Invoice) {
+	return func(i *Invoice) {
+		i.BlindedPaymentPaths = append(i.BlindedPaymentPaths, p)
+	}
+}
+
 // Features is a functional option that allows callers of NewInvoice to set the
 // desired feature bits that are advertised on the invoice. If this option is
 // not used, an empty feature vector will automatically be populated.
@@ -276,7 +302,7 @@ func Features(features *lnwire.FeatureVector) func(*Invoice) {
 // the desired payment address that is advertised on the invoice.
 func PaymentAddr(addr [32]byte) func(*Invoice) {
 	return func(i *Invoice) {
-		i.PaymentAddr = &addr
+		i.PaymentAddr = fn.Some(addr)
 	}
 }
 
@@ -353,6 +379,13 @@ func validateInvoice(invoice *Invoice) error {
 	// The invoice must contain a payment hash.
 	if invoice.PaymentHash == nil {
 		return fmt.Errorf("no payment hash found")
+	}
+
+	if len(invoice.RouteHints) != 0 &&
+		len(invoice.BlindedPaymentPaths) != 0 {
+
+		return fmt.Errorf("cannot have both route hints and blinded " +
+			"payment paths")
 	}
 
 	// Either Description or DescriptionHash must be set, not both.

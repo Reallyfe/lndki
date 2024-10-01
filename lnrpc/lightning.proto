@@ -1190,9 +1190,8 @@ message SendCoinsRequest {
     int64 sat_per_byte = 5 [deprecated = true];
 
     /*
-    If set, then the amount field will be ignored, and lnd will attempt to
-    send all the coins under control of the internal wallet to the specified
-    address.
+    If set, the amount field should be unset. It indicates lnd will send all
+    wallet coins or all selected coins to the specified address.
     */
     bool send_all = 6;
 
@@ -1208,6 +1207,9 @@ message SendCoinsRequest {
 
     // The strategy to use for selecting coins.
     CoinSelectionStrategy coin_selection_strategy = 10;
+
+    // A list of selected outpoints as inputs for the transaction.
+    repeated OutPoint outpoints = 11;
 }
 message SendCoinsResponse {
     // The transaction ID of the transaction
@@ -1590,6 +1592,11 @@ message Channel {
     the channel's operation.
     */
     string memo = 36;
+
+    /*
+    Custom channel data that might be populated in custom channels.
+    */
+    bytes custom_channel_data = 37;
 }
 
 message ListChannelsRequest {
@@ -2026,10 +2033,38 @@ message ChannelOpenUpdate {
     ChannelPoint channel_point = 1;
 }
 
+message CloseOutput {
+    // The amount in satoshi of this close output. This amount is the final
+    // commitment balance of the channel and the actual amount paid out on chain
+    // might be smaller due to subtracted fees.
+    int64 amount_sat = 1;
+
+    // The pkScript of the close output.
+    bytes pk_script = 2;
+
+    // Whether this output is for the local or remote node.
+    bool is_local = 3;
+
+    // The TLV encoded custom channel data records for this output, which might
+    // be set for custom channels.
+    bytes custom_channel_data = 4;
+}
+
 message ChannelCloseUpdate {
     bytes closing_txid = 1;
 
     bool success = 2;
+
+    // The local channel close output. If the local channel balance was dust to
+    // begin with, this output will not be set.
+    CloseOutput local_close_output = 3;
+
+    // The remote channel close output. If the remote channel balance was dust
+    // to begin with, this output will not be set.
+    CloseOutput remote_close_output = 4;
+
+    // Any additional outputs that might be added for custom channel types.
+    repeated CloseOutput additional_outputs = 5;
 }
 
 message CloseChannelRequest {
@@ -2707,6 +2742,11 @@ message PendingChannelsResponse {
         impacts the channel's operation.
         */
         string memo = 13;
+
+        /*
+        Custom channel data that might be populated in custom channels.
+        */
+        bytes custom_channel_data = 34;
     }
 
     message PendingOpenChannel {
@@ -2966,6 +3006,12 @@ message ChannelBalanceResponse {
 
     // Sum of channels pending remote balances.
     Amount pending_open_remote_balance = 8;
+
+    /*
+    Custom channel data that might be populated if there are custom channels
+    present.
+    */
+    bytes custom_channel_data = 9;
 }
 
 message QueryRoutesRequest {
@@ -3291,6 +3337,20 @@ message Route {
     The total amount in millisatoshis.
     */
     int64 total_amt_msat = 6;
+
+    /*
+    The actual on-chain amount that was sent out to the first hop. This value is
+    only different from the total_amt_msat field if this is a custom channel
+    payment and the value transported in the HTLC is different from the BTC
+    amount in the HTLC. If this value is zero, then this is an old payment that
+    didn't have this value yet and can be ignored.
+    */
+    int64 first_hop_amount_msat = 7;
+
+    /*
+    Custom channel data that might be populated in custom channels.
+    */
+    bytes custom_channel_data = 8;
 }
 
 message NodeInfoRequest {
@@ -3443,6 +3503,10 @@ message ChanInfoRequest {
     output index for the channel.
     */
     uint64 chan_id = 1 [jstype = JS_STRING];
+
+    // The channel point of the channel in format funding_txid:output_index. If
+    // chan_id is specified, this field is ignored.
+    string chan_point = 2;
 }
 
 message NetworkInfoRequest {
@@ -3832,6 +3896,48 @@ message Invoice {
     Note: Output only, don't specify for creating an invoice.
     */
     map<string, AMPInvoiceState> amp_invoice_state = 28;
+
+    /*
+    Signals that the invoice should include blinded paths to hide the true
+    identity of the recipient.
+    */
+    bool is_blinded = 29;
+
+    /*
+    Config values to use when creating blinded paths for this invoice. These
+    can be used to override the defaults config values provided in by the
+    global config. This field is only used if is_blinded is true.
+    */
+    BlindedPathConfig blinded_path_config = 30;
+}
+
+message BlindedPathConfig {
+    /*
+    The minimum number of real hops to include in a blinded path. This doesn't
+    include our node, so if the minimum is 1, then the path will contain at
+    minimum our node along with an introduction node hop. If it is zero then
+    the shortest path will use our node as an introduction node.
+    */
+    optional uint32 min_num_real_hops = 1;
+
+    /*
+    The number of hops to include in a blinded path. This doesn't include our
+    node, so if it is 1, then the path will contain our node along with an
+    introduction node or dummy node hop. If paths shorter than NumHops is
+    found, then they will be padded using dummy hops.
+    */
+    optional uint32 num_hops = 2;
+
+    /*
+    The maximum number of blinded paths to select and add to an invoice.
+    */
+    optional uint32 max_num_paths = 3;
+
+    /*
+    A list of node IDs of nodes that should not be used in any of our generated
+    blinded paths.
+    */
+    repeated bytes node_omission_list = 4;
 }
 
 enum InvoiceHTLCState {
@@ -3874,6 +3980,11 @@ message InvoiceHTLC {
 
     // Details relevant to AMP HTLCs, only populated if this is an AMP HTLC.
     AMP amp = 11;
+
+    /*
+    Custom channel data that might be populated in custom channels.
+    */
+    bytes custom_channel_data = 12;
 }
 
 // Details specific to AMP HTLCs.
@@ -4040,6 +4151,11 @@ enum PaymentFailureReason {
     Insufficient local balance.
     */
     FAILURE_REASON_INSUFFICIENT_BALANCE = 5;
+
+    /*
+    The payment was canceled.
+    */
+    FAILURE_REASON_CANCELED = 6;
 }
 
 message Payment {
@@ -4109,6 +4225,12 @@ message Payment {
     uint64 payment_index = 15;
 
     PaymentFailureReason failure_reason = 16;
+
+    /*
+    The custom TLV records that were sent to the first hop as part of the HTLC
+    wire message for this payment.
+    */
+    map<uint64, bytes> first_hop_custom_records = 17;
 }
 
 message HTLCAttempt {
@@ -4231,6 +4353,10 @@ message DeleteAllPaymentsRequest {
     Only delete failed HTLCs from payments, not the payment itself.
     */
     bool failed_htlcs_only = 2;
+
+    // Delete all payments. NOTE: Using this option requires careful
+    // consideration as it is a destructive operation.
+    bool all_payments = 3;
 }
 
 message DeletePaymentResponse {
@@ -4281,6 +4407,7 @@ message PayReq {
     bytes payment_addr = 11;
     int64 num_msat = 12;
     map<uint32, Feature> features = 13;
+    repeated BlindedPaymentPath blinded_paths = 14;
 }
 
 enum FeatureBit {
@@ -4307,6 +4434,8 @@ enum FeatureBit {
     ANCHORS_OPT = 21;
     ANCHORS_ZERO_FEE_HTLC_REQ = 22;
     ANCHORS_ZERO_FEE_HTLC_OPT = 23;
+    ROUTE_BLINDING_REQUIRED = 24;
+    ROUTE_BLINDING_OPTIONAL = 25;
     AMP_REQ = 30;
     AMP_OPT = 31;
 }
@@ -4363,6 +4492,16 @@ message FeeReportResponse {
     uint64 month_fee_sum = 4;
 }
 
+message InboundFee {
+    // The inbound base fee charged regardless of the number of milli-satoshis
+    // received in the channel. By default, only negative values are accepted.
+    int32 base_fee_msat = 1;
+
+    // The effective inbound fee rate in micro-satoshis (parts per million).
+    // By default, only negative values are accepted.
+    int32 fee_rate_ppm = 2;
+}
+
 message PolicyUpdateRequest {
     oneof scope {
         // If set, then this update applies to all currently active channels.
@@ -4396,8 +4535,9 @@ message PolicyUpdateRequest {
     // If true, min_htlc_msat is applied.
     bool min_htlc_msat_specified = 8;
 
-    int32 inbound_base_fee_msat = 10;
-    int32 inbound_fee_rate_ppm = 11;
+    // Optional inbound fee. If unset, the previously set value will be
+    // retained [EXPERIMENTAL].
+    InboundFee inbound_fee = 10;
 }
 
 enum UpdateFailure {

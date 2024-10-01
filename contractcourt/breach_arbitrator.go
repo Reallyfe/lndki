@@ -13,12 +13,13 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/labels"
+	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
@@ -731,9 +732,8 @@ justiceTxBroadcast:
 	}
 	finalTx := justiceTxs.spendAll
 
-	brarLog.Debugf("Broadcasting justice tx: %v", newLogClosure(func() string {
-		return spew.Sdump(finalTx)
-	}))
+	brarLog.Debugf("Broadcasting justice tx: %v", lnutils.SpewLogClosure(
+		finalTx))
 
 	// We'll now attempt to broadcast the transaction which finalized the
 	// channel's retribution against the cheating counter party.
@@ -856,9 +856,7 @@ Loop:
 
 				brarLog.Debugf("Broadcasting justice tx "+
 					"spending commitment outs: %v",
-					newLogClosure(func() string {
-						return spew.Sdump(tx)
-					}))
+					lnutils.SpewLogClosure(tx))
 
 				err = b.cfg.PublishTransaction(tx, label)
 				if err != nil {
@@ -873,9 +871,7 @@ Loop:
 
 				brarLog.Debugf("Broadcasting justice tx "+
 					"spending HTLC outs: %v",
-					newLogClosure(func() string {
-						return spew.Sdump(tx)
-					}))
+					lnutils.SpewLogClosure(tx))
 
 				err = b.cfg.PublishTransaction(tx, label)
 				if err != nil {
@@ -890,9 +886,7 @@ Loop:
 
 				brarLog.Debugf("Broadcasting justice tx "+
 					"spending second-level HTLC output: %v",
-					newLogClosure(func() string {
-						return spew.Sdump(tx)
-					}))
+					lnutils.SpewLogClosure(tx))
 
 				err = b.cfg.PublishTransaction(tx, label)
 				if err != nil {
@@ -1102,8 +1096,8 @@ func (bo *breachedOutput) Amount() btcutil.Amount {
 
 // OutPoint returns the breached output's identifier that is to be included as a
 // transaction input.
-func (bo *breachedOutput) OutPoint() *wire.OutPoint {
-	return &bo.outpoint
+func (bo *breachedOutput) OutPoint() wire.OutPoint {
+	return bo.outpoint
 }
 
 // RequiredTxOut returns a non-nil TxOut if input commits to a certain
@@ -1497,14 +1491,14 @@ func (b *BreachArbitrator) createSweepTx(inputs ...input.Input) (*wire.MsgTx,
 		spendableOutputs = append(spendableOutputs, inp)
 	}
 
-	txWeight := int64(weightEstimate.Weight())
+	txWeight := weightEstimate.Weight()
 
 	return b.sweepSpendableOutputsTxn(txWeight, spendableOutputs...)
 }
 
 // sweepSpendableOutputsTxn creates a signed transaction from a sequence of
 // spendable outputs by sweeping the funds into a single p2wkh output.
-func (b *BreachArbitrator) sweepSpendableOutputsTxn(txWeight int64,
+func (b *BreachArbitrator) sweepSpendableOutputsTxn(txWeight lntypes.WeightUnit,
 	inputs ...input.Input) (*wire.MsgTx, error) {
 
 	// First, we obtain a new public key script from the wallet which we'll
@@ -1547,7 +1541,7 @@ func (b *BreachArbitrator) sweepSpendableOutputsTxn(txWeight int64,
 	// transaction.
 	for _, inp := range inputs {
 		txn.AddTxIn(&wire.TxIn{
-			PreviousOutPoint: *inp.OutPoint(),
+			PreviousOutPoint: inp.OutPoint(),
 			Sequence:         inp.BlocksToMaturity(),
 		})
 	}
@@ -1641,7 +1635,7 @@ func taprootBriefcaseFromRetInfo(retInfo *retributionInfo) *taprootBriefcase {
 		case input.TaprootHtlcAcceptedRevoke:
 			fallthrough
 		case input.TaprootHtlcOfferedRevoke:
-			resID := newResolverID(*bo.OutPoint())
+			resID := newResolverID(bo.OutPoint())
 
 			var firstLevelTweak [32]byte
 			copy(firstLevelTweak[:], bo.signDesc.TapTweak)
@@ -1684,7 +1678,7 @@ func applyTaprootRetInfo(tapCase *taprootBriefcase,
 		case input.TaprootHtlcAcceptedRevoke:
 			fallthrough
 		case input.TaprootHtlcOfferedRevoke:
-			resID := newResolverID(*bo.OutPoint())
+			resID := newResolverID(bo.OutPoint())
 
 			tap1, ok := tapCase.TapTweaks.BreachedHtlcTweaks[resID]
 			if !ok {

@@ -8,8 +8,10 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/lntest/mock"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/require"
 )
@@ -60,12 +62,14 @@ func TestChainArbitratorRepublishCloses(t *testing.T) {
 	for i := 0; i < numChans/2; i++ {
 		closeTx := channels[i].FundingTxn.Copy()
 		closeTx.TxIn[0].PreviousOutPoint = channels[i].FundingOutpoint
-		err := channels[i].MarkCommitmentBroadcasted(closeTx, true)
+		err := channels[i].MarkCommitmentBroadcasted(
+			closeTx, lntypes.Local,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		err = channels[i].MarkCoopBroadcasted(closeTx, true)
+		err = channels[i].MarkCoopBroadcasted(closeTx, lntypes.Local)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -86,7 +90,8 @@ func TestChainArbitratorRepublishCloses(t *testing.T) {
 			published[tx.TxHash()]++
 			return nil
 		},
-		Clock: clock.NewDefaultClock(),
+		Clock:  clock.NewDefaultClock(),
+		Budget: *DefaultBudgetConfig(),
 	}
 	chainArb := NewChainArbitrator(
 		chainArbCfg, db,
@@ -169,7 +174,13 @@ func TestResolveContract(t *testing.T) {
 		PublishTx: func(tx *wire.MsgTx, _ string) error {
 			return nil
 		},
-		Clock: clock.NewDefaultClock(),
+		Clock:  clock.NewDefaultClock(),
+		Budget: *DefaultBudgetConfig(),
+		QueryIncomingCircuit: func(
+			circuit models.CircuitKey) *models.CircuitKey {
+
+			return nil
+		},
 	}
 	chainArb := NewChainArbitrator(
 		chainArbCfg, db,

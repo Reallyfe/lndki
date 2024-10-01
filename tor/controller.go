@@ -8,8 +8,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/textproto"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -185,6 +185,10 @@ func (c *Controller) Stop() error {
 
 	// Reset service ID.
 	c.activeServiceID = ""
+
+	if c.conn == nil {
+		return fmt.Errorf("no connection available to the tor server")
+	}
 
 	return c.conn.Close()
 }
@@ -597,7 +601,7 @@ func (c *Controller) getAuthCookie(info protocolInfo) ([]byte, error) {
 	cookieFilePath = strings.Trim(cookieFilePath, "\"")
 
 	// Read the cookie from the file and ensure it has the correct length.
-	cookie, err := ioutil.ReadFile(cookieFilePath)
+	cookie, err := os.ReadFile(cookieFilePath)
 	if err != nil {
 		return nil, err
 	}
