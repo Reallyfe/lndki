@@ -2309,6 +2309,29 @@ func (r *rpcServer) parseOpenChannelReq(in *lnrpc.OpenChannelRequest,
 
 		*channelType = lnwire.ChannelType(*fv)
 
+	case lnrpc.CommitmentType_SIMPLE_TAPROOT_OVERLAY:
+		// If the taproot overlay channel type is being set, then the
+		// channel MUST be private.
+		if !in.Private {
+			return nil, fmt.Errorf("taproot overlay channels " +
+				"must be private")
+		}
+
+		channelType = new(lnwire.ChannelType)
+		fv := lnwire.NewRawFeatureVector(
+			lnwire.SimpleTaprootOverlayChansRequired,
+		)
+
+		if in.ZeroConf {
+			fv.Set(lnwire.ZeroConfRequired)
+		}
+
+		if in.ScidAlias {
+			fv.Set(lnwire.ScidAliasRequired)
+		}
+
+		*channelType = lnwire.ChannelType(*fv)
+
 	default:
 		return nil, fmt.Errorf("unhandled request channel type %v",
 			in.CommitmentType)
@@ -4533,6 +4556,9 @@ func rpcCommitmentType(chanType channeldb.ChannelType) lnrpc.CommitmentType {
 	// first check whether it has anchors, since in that case it would also
 	// be tweakless.
 	switch {
+	case chanType.HasTapscriptRoot():
+		return lnrpc.CommitmentType_SIMPLE_TAPROOT_OVERLAY
+
 	case chanType.IsTaproot():
 		return lnrpc.CommitmentType_SIMPLE_TAPROOT
 
@@ -4544,6 +4570,7 @@ func rpcCommitmentType(chanType channeldb.ChannelType) lnrpc.CommitmentType {
 
 	case chanType.IsTweakless():
 		return lnrpc.CommitmentType_STATIC_REMOTE_KEY
+
 	default:
 
 		return lnrpc.CommitmentType_LEGACY
@@ -4578,6 +4605,11 @@ func isPrivate(dbChannel *channeldb.OpenChannel) bool {
 func encodeCustomChanData(lnChan *channeldb.OpenChannel) ([]byte, error) {
 	customOpenChanData := lnChan.CustomBlob.UnwrapOr(nil)
 	customLocalCommitData := lnChan.LocalCommitment.CustomBlob.UnwrapOr(nil)
+
+	// Don't write any custom data if both blobs are empty.
+	if len(customOpenChanData) == 0 && len(customLocalCommitData) == 0 {
+		return nil, nil
+	}
 
 	// We'll encode our custom channel data as two blobs. The first is a
 	// set of var bytes encoding of the open chan data, the second is an
@@ -6055,8 +6087,9 @@ func (r *rpcServer) AddInvoice(ctx context.Context,
 				// understand the new BOLT 11 tagged field
 				// containing the blinded path, so we switch
 				// the bit to required.
-				v.Unset(lnwire.Bolt11BlindedPathsOptional)
-				v.Set(lnwire.Bolt11BlindedPathsRequired)
+				v = feature.SetBit(
+					v, lnwire.Bolt11BlindedPathsRequired,
+				)
 			}
 
 			return v
@@ -7308,7 +7341,7 @@ func (r *rpcServer) DebugLevel(ctx context.Context,
 	if req.Show {
 		return &lnrpc.DebugLevelResponse{
 			SubSystems: strings.Join(
-				r.cfg.LogWriter.SupportedSubsystems(), " ",
+				r.cfg.SubLogMgr.SupportedSubsystems(), " ",
 			),
 		}, nil
 	}
@@ -7317,15 +7350,33 @@ func (r *rpcServer) DebugLevel(ctx context.Context,
 
 	// Otherwise, we'll attempt to set the logging level using the
 	// specified level spec.
-	err := build.ParseAndSetDebugLevels(req.LevelSpec, r.cfg.LogWriter)
+	err := build.ParseAndSetDebugLevels(req.LevelSpec, r.cfg.SubLogMgr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Propagate the new config level to the main config struct.
-	r.cfg.DebugLevel = req.LevelSpec
+	subLoggers := r.cfg.SubLogMgr.SubLoggers()
+	// Sort alphabetically by subsystem name.
+	var tags []string
+	for t := range subLoggers {
+		tags = append(tags, t)
+	}
+	sort.Strings(tags)
 
-	return &lnrpc.DebugLevelResponse{}, nil
+	// Create the log levels string.
+	var logLevels []string
+	for _, t := range tags {
+		logLevels = append(logLevels, fmt.Sprintf("%s=%s", t,
+			subLoggers[t].Level().String()))
+	}
+	logLevelsString := strings.Join(logLevels, ", ")
+
+	// Propagate the new config level to the main config struct.
+	r.cfg.DebugLevel = logLevelsString
+
+	return &lnrpc.DebugLevelResponse{
+		SubSystems: logLevelsString,
+	}, nil
 }
 
 // DecodePayReq takes an encoded payment request string and attempts to decode

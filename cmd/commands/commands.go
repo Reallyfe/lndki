@@ -54,10 +54,10 @@ var (
 
 // replaceCustomData replaces the custom channel data hex string with the
 // decoded custom channel data in the JSON response.
-func replaceCustomData(jsonBytes []byte) ([]byte, error) {
+func replaceCustomData(jsonBytes []byte) []byte {
 	// If there's nothing to replace, return the original JSON.
 	if !customDataPattern.Match(jsonBytes) {
-		return jsonBytes, nil
+		return jsonBytes
 	}
 
 	replacedBytes := customDataPattern.ReplaceAllFunc(
@@ -78,10 +78,12 @@ func replaceCustomData(jsonBytes []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	err := json.Indent(&buf, replacedBytes, "", "    ")
 	if err != nil {
-		return nil, err
+		// If we can't indent the JSON, it likely means the replacement
+		// data wasn't correct, so we return the original JSON.
+		return jsonBytes
 	}
 
-	return buf.Bytes(), nil
+	return buf.Bytes()
 }
 
 func getContext() context.Context {
@@ -118,11 +120,7 @@ func printRespJSON(resp proto.Message) {
 		return
 	}
 
-	jsonBytesReplaced, err := replaceCustomData(jsonBytes)
-	if err != nil {
-		fmt.Println("unable to replace custom data: ", err)
-		jsonBytesReplaced = jsonBytes
-	}
+	jsonBytesReplaced := replaceCustomData(jsonBytes)
 
 	fmt.Printf("%s\n", jsonBytesReplaced)
 }
@@ -463,7 +461,7 @@ func sendCoins(ctx *cli.Context) error {
 	// In case that the user has specified the sweepall flag, we'll
 	// calculate the amount to send based on the current wallet balance.
 	displayAmt := amt
-	if ctx.Bool("sweepall") {
+	if ctx.Bool("sweepall") && !ctx.IsSet("utxo") {
 		balanceResponse, err := client.WalletBalance(
 			ctxc, &lnrpc.WalletBalanceRequest{
 				MinConfs: minConfs,
@@ -482,6 +480,32 @@ func sendCoins(ctx *cli.Context) error {
 		outpoints, err = UtxosToOutpoints(utxos)
 		if err != nil {
 			return fmt.Errorf("unable to decode utxos: %w", err)
+		}
+
+		if ctx.Bool("sweepall") {
+			displayAmt = 0
+			// If we're sweeping all funds of the utxos, we'll need
+			// to set the display amount to the total amount of the
+			// utxos.
+			unspents, err := client.ListUnspent(
+				ctxc, &lnrpc.ListUnspentRequest{
+					MinConfs: 0,
+					MaxConfs: math.MaxInt32,
+				},
+			)
+			if err != nil {
+				return err
+			}
+
+			for _, utxo := range outpoints {
+				for _, unspent := range unspents.Utxos {
+					unspentUtxo := unspent.Outpoint
+					if isSameOutpoint(utxo, unspentUtxo) {
+						displayAmt += unspent.AmountSat
+						break
+					}
+				}
+			}
 		}
 	}
 
@@ -517,6 +541,10 @@ func sendCoins(ctx *cli.Context) error {
 
 	printRespJSON(txid)
 	return nil
+}
+
+func isSameOutpoint(a, b *lnrpc.OutPoint) bool {
+	return a.TxidStr == b.TxidStr && a.OutputIndex == b.OutputIndex
 }
 
 var listUnspentCommand = cli.Command{
@@ -2679,10 +2707,10 @@ func exportChanBackup(ctx *cli.Context) error {
 
 		printJSON(struct {
 			ChanPoint  string `json:"chan_point"`
-			ChanBackup []byte `json:"chan_backup"`
+			ChanBackup string `json:"chan_backup"`
 		}{
 			ChanPoint:  chanPoint.String(),
-			ChanBackup: chanBackup.ChanBackup,
+			ChanBackup: hex.EncodeToString(chanBackup.ChanBackup),
 		})
 		return nil
 	}
